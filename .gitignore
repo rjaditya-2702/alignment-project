@@ -3,7 +3,7 @@ __pycache__
 .claude
 .vscode
 logs/
-progress.md
+# progress.md
 scratch.md
 dataset/
 output/
