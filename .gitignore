@@ -1,0 +1,10 @@
+__pycache__
+.DS_Store
+.claude
+.vscode
+logs/
+progress.md
+scratch.md
+dataset/
+output/
+old_code/
