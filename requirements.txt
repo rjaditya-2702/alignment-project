@@ -1,0 +1,38 @@
+# Python 3.10 required (pomegranate 0.14.8 breaks on 3.11+)
+#
+# Install:
+#   conda create -n alignment python=3.10
+#   conda activate alignment
+#   pip install -r requirements.txt
+#
+# GPU node additionally needs:
+#   pip install torch transformers peft accelerate
+#   (bitsandbytes optional — only needed for 4-bit quantization)
+#
+# Local packages (not on PyPI — registered via .pth file):
+#   original_data/CauSciBench        (causci_bench)
+#   original_data/CauSciBench/...    (causalbenchmark)
+#
+# Environment variable required:
+#   export OPENAI_API_KEY=sk-...
+
+# ── Data & causal inference ───────────────────────────────────────────────────
+datasets==4.8.4
+pomegranate==0.14.8
+
+# ── Sandbox execution (model-generated code runs these) ───────────────────────
+pandas==2.2.3
+numpy==1.26.4
+statsmodels==0.14.1
+linearmodels==7.0
+scikit-learn==1.7.2
+scipy==1.15.3
+dowhy==0.11.1
+rdd==0.0.3
+
+# ── API ───────────────────────────────────────────────────────────────────────
+openai==2.32.0
+
+# ── Notebook ──────────────────────────────────────────────────────────────────
+jupyter
+ipykernel
