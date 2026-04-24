@@ -1,3 +1,35 @@
+"""
+Preprocessing pipeline for causal alignment training data.
+
+Input:  dataset/train.jsonl  (sources: cladder_synthetic, causcibench_synthetic)
+        dataset/test.jsonl   (sources: cladder, causcibench)
+
+For CLadder: rebuild prompt with CLADDER_PROMPT (new template uses {verbalized_story}).
+For CauSciBench: reload CSV, rebuild prompt with CAUSCI_PROMPT (adds shape + low_cardinality).
+
+Output: output/train.jsonl
+        output/test.jsonl
+"""
+
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+TRAIN_INPUT = Path("dataset/train.jsonl")
+TEST_INPUT  = Path("dataset/test.jsonl")
+OUTPUT_DIR  = Path("output")
+
+SOURCE_MAP = {
+    "cladder_synthetic": "cladder",
+    "causcibench_synthetic": "causcibench",
+    "cladder":              "cladder",
+    "causcibench":          "causcibench",
+}
+
 CLADDER_PROMPT = """You are given a scenario describing relationships between variables, along with numerical data and a question. Your task is to determine the answer by following these steps precisely.
 ---
 
@@ -88,38 +120,6 @@ Based on the computed result and what the question is asking, answer either a "y
 
 Answer:
 """
-
-"""
-Preprocessing pipeline for causal alignment training data.
-
-Input:  dataset/train.jsonl  (sources: cladder_synthetic, causcibench_synthetic)
-        dataset/test.jsonl   (sources: cladder, causcibench)
-
-For CLadder: rebuild prompt with CLADDER_PROMPT (new template uses {verbalized_story}).
-For CauSciBench: reload CSV, rebuild prompt with CAUSCI_PROMPT (adds shape + low_cardinality).
-
-Output: output/train.jsonl
-        output/test.jsonl
-"""
-
-import json
-import sys
-from collections import Counter
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-
-TRAIN_INPUT = Path("dataset/train.jsonl")
-TEST_INPUT  = Path("dataset/test.jsonl")
-OUTPUT_DIR  = Path("output")
-
-SOURCE_MAP = {
-    "cladder_synthetic": "cladder",
-    "causcibench_synthetic": "causcibench",
-    "cladder":              "cladder",
-    "causcibench":          "causcibench",
-}
 
 CAUSCI_PROMPT = """You are given a dataset from a research study along with a description of how the data was collected. Your task is to estimate the effect of one variable on another by following these steps precisely.
 
