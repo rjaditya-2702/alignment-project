@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from transformers import BitsAndBytesConfig
 from src.training.reward import compute_rewards
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
@@ -59,13 +59,22 @@ SANDBOX_WORKERS = 8
 
 LORA_CONFIG = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
-    r=16,
-    lora_alpha=32,
-    lora_dropout=0.05,
+    r=1024,
+    lora_alpha=2048,
+    lora_dropout=0.02,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
+                     "gate_proj", "up_proj", "down_proj"],
     bias="none",
 )
+
+QUANT_CONFIG = BitsAndBytesConfig(
+    load_in_8bit=True,
+    bnb_8bit_quant_type="nf4",
+    bnb_8bit_compute_dtype=torch.bfloat16,
+    bnb_8bit_use_double_quant=True,
+)
+
+# QUANT_CONFIG = None
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -74,16 +83,30 @@ def load_policy(model_name: str):
     print(f"Loading tokenizer from {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        if "<|endoftext|>" in tokenizer.get_vocab():
+            tokenizer.pad_token = "<|endoftext|>"
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     tokenizer.padding_side = "left"
 
-    print(f"Loading model from {model_name}")
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    print(f"Loading model from {model_name} → {device}")
     base = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+        # torch_dtype=torch.bfloat16,
+        quantization_config=None, # i will replace it with QUANT_CONFIG after testing
         trust_remote_code=True,
-    )
+    ).to(device)
+
+    # resize embeddings if we added a new token
+    if len(tokenizer) > base.config.vocab_size:
+        base.resize_token_embeddings(len(tokenizer))
 
     model = get_peft_model(base, LORA_CONFIG)
     model.enable_input_require_grads()
@@ -92,12 +115,26 @@ def load_policy(model_name: str):
     return model, tokenizer
 
 
+# ── Chat formatting ───────────────────────────────────────────────────────────
+
+def format_prompt(tokenizer, prompt: str) -> str:
+    """Wrap raw prompt in Qwen3 chat template with thinking disabled."""
+    messages = [{"role": "user", "content": prompt}]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
+
 # ── Generation ────────────────────────────────────────────────────────────────
 
 def generate_rollouts(model, tokenizer, prompt: str, n: int, device: str) -> list[str]:
     """Generate n completions for one prompt. No gradient."""
+    formatted = format_prompt(tokenizer, prompt)
     enc = tokenizer(
-        prompt,
+        formatted,
         return_tensors="pt",
         truncation=True,
         max_length=MAX_PROMPT_LEN,
@@ -126,24 +163,22 @@ def generate_rollouts(model, tokenizer, prompt: str, n: int, device: str) -> lis
 def sequence_logprob(model, prompt_ids: torch.Tensor, comp_ids: torch.Tensor) -> torch.Tensor:
     """
     Mean per-token log prob of comp_ids given prompt_ids.
-    prompt_ids: [P]   (1D, on device)
+    prompt_ids: [P]   (1D, on device) — must be tokenized from format_prompt() output
     comp_ids:   [C]   (1D, on device)
     Returns scalar tensor.
     """
-    full_ids = torch.cat([prompt_ids, comp_ids]).unsqueeze(0)     # [1, P+C]
+    full_ids = torch.cat([prompt_ids, comp_ids]).unsqueeze(0)
     attn_mask = torch.ones_like(full_ids)
 
     outputs = model(input_ids=full_ids, attention_mask=attn_mask)
-    logits = outputs.logits[0]                                     # [P+C, V]
+    logits = outputs.logits[0]
 
-    # shift: logit[t] predicts token[t+1]
-    log_probs = F.log_softmax(logits[:-1], dim=-1)                 # [P+C-1, V]
-    labels    = full_ids[0, 1:]                                    # [P+C-1]
-    token_lp  = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)  # [P+C-1]
+    log_probs = F.log_softmax(logits[:-1], dim=-1)
+    labels    = full_ids[0, 1:]
+    token_lp  = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)
 
-    # slice out completion positions: index [P-1 : P-1+C]
     P, C = prompt_ids.shape[0], comp_ids.shape[0]
-    comp_lp = token_lp[P - 1 : P - 1 + C]                        # [C]
+    comp_lp = token_lp[P - 1 : P - 1 + C]
 
     return comp_lp.mean()
 

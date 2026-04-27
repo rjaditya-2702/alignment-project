@@ -156,14 +156,15 @@ Return ONLY a valid JSON object (no markdown):
         model="gpt-5.4-mini",
         max_completion_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
     )
-    text = response.choices[0].message.content.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:])
-        if text.endswith("```"):
-            text = text[:-3].strip()
-    return json.loads(text)
+    # text = response.choices[0].message.content.strip()
+    # if text.startswith("```"):
+    #     lines = text.split("\n")
+    #     text = "\n".join(lines[1:])
+    #     if text.endswith("```"):
+    #         text = text[:-3].strip()
+    return json.loads(response.choices[0].message.content.strip())
 
 
 def _build_prompt(df, description, query, csv_path):
@@ -172,7 +173,7 @@ def _build_prompt(df, description, query, csv_path):
     missing_str = "\n".join(f"  {c}: {v}" for c, v in missing.items() if v > 0) or "  none"
     return CAUSCIBENCH_PROMPT.format(
         dataset_description=description,
-        file_path=str(csv_path.resolve()),
+        file_path=str(csv_path),
         columns_and_types=columns_and_types,
         df_head=df.head().to_string(index=False),
         df_describe=df.describe().to_string(),

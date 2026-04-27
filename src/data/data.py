@@ -163,7 +163,7 @@ def build_causcibench_prompt(entry: dict) -> str:
 
     return CAUSCIBENCH_PROMPT.format(
         dataset_description=entry["dataset_description"],
-        file_path=str(csv_path.resolve()),
+        file_path=str(csv_path),
         columns_and_types=columns_and_types,
         df_head=df_head,
         df_describe=df_describe,

@@ -14,12 +14,22 @@ import re
 # ── Generic helpers ────────────────────────────────────────────────────────────
 
 def _extract_step(text: str, step_num: int, next_step_num: int | None = None) -> str:
-    """Extract text between ## Step N and ## Step N+1 (or end of string)."""
+    """Extract text between ## Step N and ## Step N+1 (or end of string).
+
+    If ## Step 1 is not found (because the prompt already contained the header
+    and the completion starts mid-step), step 1 content is taken from position 0
+    up to the next step header.
+    """
     start_pat = rf"##\s*Step\s*{step_num}\b"
     start = re.search(start_pat, text, re.IGNORECASE)
     if not start:
-        return ""
-    content_start = start.end()
+        if step_num == 1:
+            # Prompt ended with ## Step 1 header; completion starts with step 1 body
+            content_start = 0
+        else:
+            return ""
+    else:
+        content_start = start.end()
     if next_step_num is not None:
         end_pat = rf"##\s*Step\s*{next_step_num}\b"
         end = re.search(end_pat, text[content_start:], re.IGNORECASE)
@@ -72,14 +82,15 @@ def parse_cladder(completion: str) -> dict:
     step4_code = _extract_code_block(step4_raw)
 
     # Step 5: normalize to yes/no
-    ans = _extract_answer_line(step5_raw) or step5_raw
-    ans_lower = ans.lower().strip()
-    if ans_lower.startswith("yes"):
+    # Search broadly — heading tail (": Answer") and filler before the word are stripped
+    if re.search(r"\byes\b", step5_raw, re.IGNORECASE):
         step5 = "yes"
-    elif ans_lower.startswith("no"):
+    elif re.search(r"\bno\b", step5_raw, re.IGNORECASE):
         step5 = "no"
     else:
-        step5 = ans_lower[:10]  # keep raw prefix for debugging
+        # fall back to Answer: line or raw prefix
+        ans = _extract_answer_line(step5_raw) or step5_raw.strip()
+        step5 = "yes" if ans.lower().startswith("yes") else ("no" if ans.lower().startswith("no") else ans[:10].lower())
 
     return {
         "step1": step1,

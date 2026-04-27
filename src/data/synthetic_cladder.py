@@ -4,6 +4,9 @@ Uses RandomBuilder to sample random SCM parameters per story.
 """
 
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from original_data.Cladder.cladder.causalbenchmark.generator import generate_questions
 from original_data.Cladder.cladder.causalbenchmark.graphs.builders import RandomBuilder

@@ -12,16 +12,17 @@ Output: output/train.jsonl
 """
 
 import json
-import sys
+import os
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-TRAIN_INPUT = Path("dataset/train.jsonl")
-TEST_INPUT  = Path("dataset/test.jsonl")
-OUTPUT_DIR  = Path("output")
+ROOT        = Path(__file__).parent.parent.parent
+TRAIN_INPUT = ROOT / "dataset" / "train.jsonl"
+TEST_INPUT  = ROOT / "dataset" / "test.jsonl"
+OUTPUT_DIR  = ROOT / "output"
 
 SOURCE_MAP = {
     "cladder_synthetic": "cladder",
@@ -33,7 +34,15 @@ SOURCE_MAP = {
 CLADDER_PROMPT = """You are given a scenario describing relationships between variables, along with numerical data and a question. Your task is to determine the answer by following these steps precisely.
 ---
 
-Use the following reference to guide your reasoning.
+Strict rules (follow these exactly):
+- Output ONLY the five numbered steps in order.
+- Nothing before "## Step 1" and nothing after the single word in Step 5.
+- Write each step exactly once.
+- Each step must be short and direct. No long paragraphs or verbosity.
+- Do not repeat content from previous steps.
+- Step 5 must contain exactly one word on its own line: "Yes" or "No". No quotes, no extra text, no code, no periods.
+- Do not repeat any step, any code block, or the word "Yes".
+- Stop immediately after Step 5. Do not continue generating. No extra sentences, no "Okay let's see", no repetition.
 
 ### Query Type Definitions
 
@@ -85,7 +94,7 @@ Now solve the problem.
 
 ## Step 1: Causal Structure
 Assign algebraic variables (e.g., X, Y, Z) to each entity mentioned in the scenario. Identify all directed causal edges.
-Format: V1 -> V2, V2 -> V3
+For example: V1 -> V2, V2 -> V3
 
 ## Step 2: Query Classification
 Based on the question and the definitions above, classify this query. Return exactly one of:
@@ -105,20 +114,23 @@ Rewrite the expression from Step 3 using only the numerical values given in the 
 Return the code inside a ```python block. The code must:
 - Define each probability value as a variable
 - Compute the final estimand step by step
-- Print exactly one line: result=<number> for numerical queries, or result=yes / result=no for qualitative queries (backadj, collider_bias, exp_away)
+- Print exactly one line: result=<number> for numerical queries, or result=yes / result=no for qualitative queries
+- Never print True or False — always yes or no for boolean outcomes
 
 ## Step 5: Answer
-Based on the computed result and what the question is asking, answer either a "yes" or a "no".
-- For ate/ett/nde/nie: if the result is positive and the question asks "does X increase Y", answer Yes. If negative, answer No. Vice versa if the question asks "does X decrease Y".
-- For marginal: if P(Y) > 0.5 and the question asks "is Y more likely than not", answer Yes.
-- For correlation: if P(Y|X=1) > P(Y|X=0) and the question asks "does observing X increase Y", answer Yes.
-- For backadj/collider_bias/exp_away: answer Yes or No based on the graph analysis.
-- For det-counterfactual: answer based on the computed probability and what the question asks.
+Based on the computed result and what the question is asking, answer Yes or No. One word only.
+- For ate/ett/nde/nie: positive result → Yes if question asks "does X increase Y", No if "decrease". Flip if question asks the opposite.
+- For marginal: P(Y) > 0.5 and question asks "is Y more likely than not" → Yes.
+- For correlation: P(Y|X=1) > P(Y|X=0) and question asks "does observing X increase Y" → Yes.
+- For backadj/collider_bias/exp_away: Yes or No based on graph analysis.
+- For det-counterfactual: Yes or No based on computed probability.
+
+IMPORTANT: After writing Step 5 with a single word, STOP. No more text is allowed.
 
 ## Scenario
 {verbalized_story}
 
-Answer:
+Respond now with exactly the five steps. Begin directly with ## Step 1.
 """
 
 CAUSCI_PROMPT = """You are given a dataset from a research study along with a description of how the data was collected. Your task is to estimate the effect of one variable on another by following these steps precisely.
@@ -220,7 +232,7 @@ Use the following reference to guide your reasoning.
 
 ---
 
-Now solve the problem.
+Respond with the five numbered steps below in order. Do not write any introduction, explanation, or preamble before Step 1. Write each step exactly once. Stop after Step 5.
 
 ## Step 1: Causal Structure
 Using the study description and dataset columns, identify:
@@ -254,8 +266,7 @@ Return the code inside a ```python block. The code must:
 - Print exactly one line: result=<number>
 
 ## Step 5: Answer
-Report the estimated effect.
-Answer:
+Report the estimated effect as a single number.
 """
 
 
@@ -406,25 +417,30 @@ def process_causcibench_row(row, split, csv_failures):
     description, file_path, query = _parse_causci_prompt_fields(row["prompt"])
 
     csv_path = Path(file_path)
+    if not csv_path.is_absolute():
+        csv_path = ROOT / csv_path
+    else:
+        # Re-anchor absolute paths to ROOT in case they came from a different machine
+        for i, part in enumerate(csv_path.parts):
+            if part == "dataset":
+                csv_path = ROOT / Path(*csv_path.parts[i:])
+                break
+
     if not csv_path.exists():
-        print(f"  WARNING: CSV not found for {row['id']}: {file_path}")
+        print(f"  WARNING: CSV not found for {row['id']}: {csv_path}")
         csv_failures.append(row["id"])
         return None
 
-    try:
-        df = pd.read_csv(csv_path, low_memory=False)
-    except Exception as e:
-        print(f"  WARNING: CSV load failed for {row['id']}: {e}")
-        csv_failures.append(row["id"])
-        return None
+    df = pd.read_csv(csv_path, low_memory=False)
 
     step1 = row.get("groundtruth", {}).get("step1")
     shape, columns_and_types, df_head, df_describe, missing_str, low_cardinality_str = \
         _compute_df_metadata(df, step1)
 
+    rel_path = str(csv_path.relative_to(ROOT))
     prompt = CAUSCI_PROMPT.format(
         dataset_description=description,
-        file_path=file_path,
+        file_path=rel_path,
         shape=shape,
         columns_and_types=columns_and_types,
         df_head=df_head,
@@ -527,7 +543,7 @@ def _validate(train_rows, test_rows, csv_failures):
 # ── Main ──────────────────────────────────────────────────────────────
 
 def preprocess():
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     train_rows, test_rows, csv_failures = [], [], []
 

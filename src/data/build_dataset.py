@@ -12,14 +12,18 @@ Output: dataset/unified.jsonl  (one JSON object per line)
 """
 
 import json
+import sys
 from collections import Counter
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data import load_cladder, load_causcibench
 from synthetic_cladder import load_cladder_synthetic
 from synthetic_causci import generate_causci_synthetic
 
-OUTPUT_DIR  = Path("dataset")
+ROOT = Path(__file__).resolve().parents[2]
+OUTPUT_DIR  = ROOT / "dataset"
 OUTPUT_FILE = OUTPUT_DIR / "unified.jsonl"
 
 CKPT = {
@@ -88,6 +92,16 @@ def build():
         _save(causci_synth, CKPT[4])
     print(f"   {len(causci_synth)} examples")
     all_data.extend(causci_synth)
+
+    # Deduplicate by prompt — keep first occurrence
+    seen = set()
+    deduped = []
+    for row in all_data:
+        if row["prompt"] not in seen:
+            seen.add(row["prompt"])
+            deduped.append(row)
+    print(f"Dropped {len(all_data) - len(deduped)} duplicate prompts")
+    all_data = deduped
 
     print("=" * 50)
     print(f"Total: {len(all_data)} examples")
