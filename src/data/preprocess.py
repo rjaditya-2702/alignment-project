@@ -109,13 +109,7 @@ Using the causal graph from Step 1 and the query type from Step 2, write the mat
 Show your derivation.
 
 ## Step 4: Compute
-Rewrite the expression from Step 3 using only the numerical values given in the Data section. Then provide executable Python code that computes the result.
-
-Return the code inside a ```python block. The code must:
-- Define each probability value as a variable
-- Compute the final estimand step by step
-- Print exactly one line: result=<number> for numerical queries, or result=yes / result=no for qualitative queries
-- Never print True or False — always yes or no for boolean outcomes
+Using the estimand from Step 3 and the numerical values given in the Data section, compute the result step by step. Show the arithmetic explicitly — substitute each probability value and simplify to a final number.
 
 ## Step 5: Answer
 Based on the computed result and what the question is asking, answer Yes or No. One word only.
@@ -256,14 +250,8 @@ Write the formal estimation setup:
 - The estimand (ATE, ATT, LATE, etc.)
 - The key identification assumption being invoked
 
-## Step 4: Implement
-Write executable Python code that loads the dataset, preprocesses it, implements the method from Step 3, and computes the effect.
-
-Return the code inside a ```python block. The code must:
-- Load the data: pd.read_csv("{file_path}")
-- Handle missing values and encoding as needed
-- Implement the chosen method using only: pandas, numpy, statsmodels, linearmodels, dowhy, rdd, sklearn, scipy
-- Print exactly one line: result=<number>
+## Step 4: Compute
+Using the estimation specification from Step 3 and the data summary above (column types, summary statistics, sample rows), compute the effect estimate numerically. Show the arithmetic step by step — substitute values and simplify to a final number.
 
 ## Step 5: Answer
 Report the estimated effect as a single number.
@@ -391,7 +379,7 @@ def process_cladder_row(row, split):
 
     step3 = None if _is_null(gt.get("step3")) else gt.get("step3")
     step4 = None if _is_null(gt.get("step4")) else gt.get("step4")
-    has_nan = (step3 is None) or (step4 is None)
+    has_nan = step3 is None
 
     out = {
         "id":         row["id"],
@@ -497,7 +485,7 @@ def _validate(train_rows, test_rows, csv_failures):
     print(f"train: {train_nan}")
     print(f"test:  {test_nan}")
     if train_nan > 0:
-        print(f"  NOTE: {train_nan} train rows have empty step4 — kept as-is, step4 set to null")
+        print(f"  NOTE: {train_nan} train rows have null step3 (estimand) — kept as-is")
 
     for name, rows in [("Train", train_cs), ("Test", test_cs)]:
         counts  = Counter(r["groundtruth"]["step2"] for r in rows)

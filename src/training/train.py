@@ -1,20 +1,19 @@
 """
 GRPO post-training for causal alignment.
 
-Policy:    Qwen3-14B + LoRA (r=16) — trainable
+Policy:    Qwen3-14B + LoRA — trainable
 Reference: same base weights with adapters disabled — frozen
 
 Algorithm:
-  For each prompt, generate N rollouts from the policy.
-  Score each rollout with the reward functions (subprocess sandbox).
-  Normalize rewards within the group: â = (r - mean) / std.
-  GRPO loss = -mean(â * per-token-logprob) + β * KL(policy || ref)
-  where KL is computed per token from logprobs (no ratio clipping —
-  single-step online update so ratio = 1 exactly at update time).
+  For each batch of B prompts, generate N rollouts each (B*N total).
+  Score all rollouts with reward functions (heuristics + DeepSeek-Math judge).
+  Normalize rewards within each prompt's group of N: â = (r - mean) / std.
+  GRPO loss = mean over valid groups of [-mean(â * logprob) + β * KL(policy || ref)]
+  Logprobs computed in one batched forward pass per model (policy and ref separately).
 
 Usage:
     python src/training/train.py
-    python src/training/train.py --model Qwen/Qwen3-14B --n-rollouts 8 --epochs 2
+    python src/training/train.py --model Qwen/Qwen3-14B --n-rollouts 8 --batch-size 4
     python src/training/train.py --resume output/checkpoints/step_500
 """
 
@@ -37,9 +36,11 @@ from src.training.reward import compute_rewards
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 DEFAULT_MODEL   = "Qwen/Qwen3-14B"
+JUDGE_MODEL     = "deepseek-ai/deepseek-math-7b-instruct"
 TRAIN_DATA      = ROOT / "output" / "train.jsonl"
 OUTPUT_DIR      = ROOT / "output" / "checkpoints"
 
+BATCH_SIZE      = 4       # prompts per training step
 N_ROLLOUTS      = 8       # completions per prompt
 MAX_PROMPT_LEN  = 3072    # truncate prompt to this many tokens
 MAX_NEW_TOKENS  = 2048    # max completion length
@@ -49,18 +50,19 @@ TOP_P           = 0.9
 BETA            = 0.01    # KL coefficient
 LR              = 2e-5
 WEIGHT_DECAY    = 0.01
-GRAD_ACCUM      = 8       # optimizer step every N prompts
+GRAD_ACCUM      = 8       # optimizer step every N steps
 MAX_GRAD_NORM   = 1.0
 
 MAX_EPOCHS      = 3
 SAVE_EVERY      = 500     # global steps between checkpoints
 LOG_EVERY       = 10      # global steps between log lines
-SANDBOX_WORKERS = 8
+
+R = 32
 
 LORA_CONFIG = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
-    r=1024,
-    lora_alpha=2048,
+    r=R,
+    lora_alpha=64,
     lora_dropout=0.02,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                      "gate_proj", "up_proj", "down_proj"],
@@ -75,6 +77,11 @@ QUANT_CONFIG = BitsAndBytesConfig(
 )
 
 # QUANT_CONFIG = None
+
+JUDGE_QUANT_CONFIG = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -99,12 +106,10 @@ def load_policy(model_name: str):
     print(f"Loading model from {model_name} → {device}")
     base = AutoModelForCausalLM.from_pretrained(
         model_name,
-        # torch_dtype=torch.bfloat16,
-        quantization_config=None, # i will replace it with QUANT_CONFIG after testing
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     ).to(device)
 
-    # resize embeddings if we added a new token
     if len(tokenizer) > base.config.vocab_size:
         base.resize_token_embeddings(len(tokenizer))
 
@@ -112,6 +117,24 @@ def load_policy(model_name: str):
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.print_trainable_parameters()
+    return model, tokenizer
+
+
+def load_judge(model_name: str):
+    print(f"Loading judge tokenizer from {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    print(f"Loading judge model from {model_name} (4-bit)")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=JUDGE_QUANT_CONFIG,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
     return model, tokenizer
 
 
@@ -130,12 +153,19 @@ def format_prompt(tokenizer, prompt: str) -> str:
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
-def generate_rollouts(model, tokenizer, prompt: str, n: int, device: str) -> list[str]:
-    """Generate n completions for one prompt. No gradient."""
-    formatted = format_prompt(tokenizer, prompt)
+def generate_batch_rollouts(
+    model, tokenizer, prompts: list[str], n: int, device: str
+) -> list[str]:
+    """
+    Generate n rollouts for each of B prompts.
+    Returns flat list of B*N completions ordered [p0r0..p0rN-1, p1r0..p1rN-1, ...].
+    No gradient.
+    """
+    formatted = [format_prompt(tokenizer, p) for p in prompts]
     enc = tokenizer(
         formatted,
         return_tensors="pt",
+        padding=True,
         truncation=True,
         max_length=MAX_PROMPT_LEN,
     ).to(device)
@@ -150,7 +180,7 @@ def generate_rollouts(model, tokenizer, prompt: str, n: int, device: str) -> lis
             num_return_sequences=n,
             pad_token_id=tokenizer.pad_token_id,
         )
-
+    # out_ids: [B*N, seq_len] — all N rollouts for prompt 0 first, then prompt 1, etc.
     prompt_len = enc["input_ids"].shape[1]
     return [
         tokenizer.decode(out[prompt_len:], skip_special_tokens=True)
@@ -158,29 +188,50 @@ def generate_rollouts(model, tokenizer, prompt: str, n: int, device: str) -> lis
     ]
 
 
-# ── Logprob computation ───────────────────────────────────────────────────────
+# ── Batched logprob computation ───────────────────────────────────────────────
 
-def sequence_logprob(model, prompt_ids: torch.Tensor, comp_ids: torch.Tensor) -> torch.Tensor:
+def batched_sequence_logprobs(
+    model,
+    prompt_ids_list: list[torch.Tensor],
+    comp_ids_list: list[torch.Tensor],
+    pad_id: int,
+) -> list[torch.Tensor]:
     """
-    Mean per-token log prob of comp_ids given prompt_ids.
-    prompt_ids: [P]   (1D, on device) — must be tokenized from format_prompt() output
-    comp_ids:   [C]   (1D, on device)
-    Returns scalar tensor.
+    Compute mean per-token completion logprob for each (prompt, completion) pair
+    in a single batched forward pass (right-padded).
+
+    prompt_ids_list: list of BN 1D tensors
+    comp_ids_list:   list of BN 1D tensors
+    Returns list of BN scalar tensors (grad flows if model is in train mode).
     """
-    full_ids = torch.cat([prompt_ids, comp_ids]).unsqueeze(0)
-    attn_mask = torch.ones_like(full_ids)
+    BN = len(prompt_ids_list)
+    dev = prompt_ids_list[0].device
 
-    outputs = model(input_ids=full_ids, attention_mask=attn_mask)
-    logits = outputs.logits[0]
+    full_ids = [torch.cat([p, c]) for p, c in zip(prompt_ids_list, comp_ids_list)]
+    max_len = max(f.shape[0] for f in full_ids)
 
-    log_probs = F.log_softmax(logits[:-1], dim=-1)
-    labels    = full_ids[0, 1:]
-    token_lp  = log_probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+    padded    = torch.full((BN, max_len), pad_id, dtype=torch.long, device=dev)
+    attn_mask = torch.zeros(BN, max_len, dtype=torch.long, device=dev)
+    for i, f in enumerate(full_ids):
+        padded[i, :f.shape[0]] = f
+        attn_mask[i, :f.shape[0]] = 1
 
-    P, C = prompt_ids.shape[0], comp_ids.shape[0]
-    comp_lp = token_lp[P - 1 : P - 1 + C]
+    outputs  = model(input_ids=padded, attention_mask=attn_mask)
+    logits   = outputs.logits                                          # [BN, max_len, V]
+    log_probs = F.log_softmax(logits[:, :-1], dim=-1)                 # [BN, max_len-1, V]
+    labels    = padded[:, 1:]                                          # [BN, max_len-1]
+    token_lp  = log_probs.gather(2, labels.unsqueeze(2)).squeeze(2)   # [BN, max_len-1]
 
-    return comp_lp.mean()
+    result = []
+    for i, (p, c) in enumerate(zip(prompt_ids_list, comp_ids_list)):
+        P, C = p.shape[0], c.shape[0]
+        if C == 0:
+            result.append(torch.zeros(1, device=dev).squeeze())
+            continue
+        comp_lp = token_lp[i, P - 1 : P - 1 + C]
+        result.append(comp_lp.mean())
+
+    return result
 
 
 # ── GRPO loss ─────────────────────────────────────────────────────────────────
@@ -191,13 +242,8 @@ def grpo_loss(
     rewards: torch.Tensor,      # [N]
     beta: float = BETA,
 ) -> torch.Tensor:
-    # Group-normalize rewards → advantages
-    adv = (rewards - rewards.mean()) / (rewards.std() + 1e-8)   # [N]
-
-    # KL(policy || ref) per completion, per-token mean
-    kl = policy_lps - ref_lps                                    # [N]
-
-    # Policy gradient + KL penalty
+    adv = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    kl  = policy_lps - ref_lps
     return -(adv * policy_lps).mean() + beta * kl.mean()
 
 
@@ -211,7 +257,8 @@ def train(args):
         all_rows = [json.loads(l) for l in f]
     print(f"Loaded {len(all_rows)} training rows")
 
-    model, tokenizer = load_policy(args.resume or args.model)
+    model, tokenizer             = load_policy(args.resume or args.model)
+    judge_model, judge_tokenizer = load_judge(JUDGE_MODEL)
     device = next(model.parameters()).device
 
     optimizer = torch.optim.AdamW(
@@ -220,74 +267,89 @@ def train(args):
         weight_decay=WEIGHT_DECAY,
     )
 
-    global_step = 0
+    global_step  = 0
 
     for epoch in range(args.epochs):
         random.shuffle(all_rows)
         optimizer.zero_grad()
-        accum_loss = 0.0
-        accum_reward = 0.0
+        accum_loss = accum_reward = 0.0
         n_accum = 0
 
-        for row in all_rows:
-            # ── 1. Generate rollouts ──────────────────────────────────
+        for batch_start in range(0, len(all_rows), args.batch_size):
+            batch = all_rows[batch_start : batch_start + args.batch_size]
+            B     = len(batch)
+            N     = args.n_rollouts
+
+            # ── 1. Generate B*N rollouts ──────────────────────────────
             model.eval()
-            completions = generate_rollouts(model, tokenizer, row["prompt"], args.n_rollouts, str(device))
+            all_completions = generate_batch_rollouts(
+                model, tokenizer, [r["prompt"] for r in batch], N, str(device)
+            )
             model.train()
 
-            # ── 2. Compute rewards (parallel sandbox) ─────────────────
-            rewards_list = compute_rewards(
-                completions, [row] * args.n_rollouts, max_workers=args.sandbox_workers
-            )
-            rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
+            # ── 2. Compute rewards ────────────────────────────────────
+            flat_rows    = [r for r in batch for _ in range(N)]
+            rewards_list = compute_rewards(all_completions, flat_rows, judge_model, judge_tokenizer)
+            rewards      = torch.tensor(rewards_list, dtype=torch.float32, device=device).view(B, N)
 
-            # Skip if all rewards identical (zero variance → no signal)
-            if rewards.std() < 1e-6:
+            # Skip batch if every group has zero variance
+            if all(rewards[b].std() < 1e-6 for b in range(B)):
                 continue
 
-            # ── 3. Tokenize prompt ────────────────────────────────────
-            prompt_ids = tokenizer(
-                row["prompt"],
-                return_tensors="pt",
-                truncation=True,
-                max_length=MAX_PROMPT_LEN,
-                add_special_tokens=True,
-            ).input_ids[0].to(device)
+            # ── 3. Tokenize all prompts and completions ───────────────
+            # Each prompt repeated N times to pair with its rollouts
+            prompt_ids_list = []
+            for row in batch:
+                ids = tokenizer(
+                    row["prompt"],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=MAX_PROMPT_LEN,
+                    add_special_tokens=True,
+                ).input_ids[0].to(device)
+                for _ in range(N):
+                    prompt_ids_list.append(ids)
 
-            policy_lps = []
-            ref_lps    = []
-
-            for completion in completions:
-                comp_ids = tokenizer(
-                    completion,
+            comp_ids_list = []
+            for comp in all_completions:
+                ids = tokenizer(
+                    comp,
                     return_tensors="pt",
                     add_special_tokens=False,
                     truncation=True,
                     max_length=MAX_NEW_TOKENS,
                 ).input_ids[0].to(device)
+                comp_ids_list.append(ids)
 
-                if comp_ids.shape[0] == 0:
-                    zero = torch.zeros(1, device=device)
-                    policy_lps.append(zero.squeeze().requires_grad_(True))
-                    ref_lps.append(zero.squeeze())
+            # ── 4. Policy logprobs — one batched forward pass ─────────
+            policy_lps_flat = batched_sequence_logprobs(
+                model, prompt_ids_list, comp_ids_list, tokenizer.pad_token_id
+            )
+
+            # ── 5. Reference logprobs — adapters off, no grad ─────────
+            model.disable_adapter_layers()
+            with torch.no_grad():
+                ref_lps_flat = batched_sequence_logprobs(
+                    model, prompt_ids_list, comp_ids_list, tokenizer.pad_token_id
+                )
+            model.enable_adapter_layers()
+
+            # ── 6. Reshape [B, N] and compute GRPO loss ───────────────
+            policy_lps_t = torch.stack(policy_lps_flat).view(B, N)
+            ref_lps_t    = torch.stack(ref_lps_flat).view(B, N).detach()
+
+            losses = []
+            for b in range(B):
+                if rewards[b].std() < 1e-6:
                     continue
+                losses.append(
+                    grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b], beta=args.beta)
+                )
 
-                # Policy logprob — with gradient
-                lp = sequence_logprob(model, prompt_ids, comp_ids)
-                policy_lps.append(lp)
+            if not losses:
+                continue
 
-                # Reference logprob — disable LoRA, no gradient
-                model.disable_adapter_layers()
-                with torch.no_grad():
-                    ref_lp = sequence_logprob(model, prompt_ids, comp_ids)
-                model.enable_adapter_layers()
-                ref_lps.append(ref_lp)
-
-            policy_lps_t = torch.stack(policy_lps)           # [N]
-            ref_lps_t    = torch.stack(ref_lps).detach()     # [N]
-
-            # ── 4. GRPO loss ──────────────────────────────────────────
-            loss = grpo_loss(policy_lps_t, ref_lps_t, rewards, beta=args.beta)
+            loss = torch.stack(losses).mean()
             (loss / args.grad_accum).backward()
 
             accum_loss   += loss.item()
@@ -295,7 +357,7 @@ def train(args):
             n_accum      += 1
             global_step  += 1
 
-            # ── 5. Optimizer step every grad_accum prompts ────────────
+            # ── 7. Optimizer step ─────────────────────────────────────
             if global_step % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
@@ -335,17 +397,17 @@ def train(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model",           default=DEFAULT_MODEL)
-    parser.add_argument("--resume",          default=None,    help="Resume from checkpoint dir")
-    parser.add_argument("--output-dir",      default=str(OUTPUT_DIR))
-    parser.add_argument("--epochs",          type=int,   default=MAX_EPOCHS)
-    parser.add_argument("--n-rollouts",      type=int,   default=N_ROLLOUTS)
-    parser.add_argument("--beta",            type=float, default=BETA)
-    parser.add_argument("--lr",              type=float, default=LR)
-    parser.add_argument("--grad-accum",      type=int,   default=GRAD_ACCUM)
-    parser.add_argument("--save-every",      type=int,   default=SAVE_EVERY)
-    parser.add_argument("--log-every",       type=int,   default=LOG_EVERY)
-    parser.add_argument("--sandbox-workers", type=int,   default=SANDBOX_WORKERS)
+    parser.add_argument("--model",       default=DEFAULT_MODEL)
+    parser.add_argument("--resume",      default=None,         help="Resume from checkpoint dir")
+    parser.add_argument("--output-dir",  default=str(OUTPUT_DIR))
+    parser.add_argument("--epochs",      type=int,   default=MAX_EPOCHS)
+    parser.add_argument("--batch-size",  type=int,   default=BATCH_SIZE,  help="Prompts per training step")
+    parser.add_argument("--n-rollouts",  type=int,   default=N_ROLLOUTS)
+    parser.add_argument("--beta",        type=float, default=BETA)
+    parser.add_argument("--lr",          type=float, default=LR)
+    parser.add_argument("--grad-accum",  type=int,   default=GRAD_ACCUM)
+    parser.add_argument("--save-every",  type=int,   default=SAVE_EVERY)
+    parser.add_argument("--log-every",   type=int,   default=LOG_EVERY)
     args = parser.parse_args()
     train(args)
 
