@@ -1,154 +1,105 @@
 # Causal Alignment
 
-Fine-tuning Qwen3-14B on causal reasoning via GRPO (Group Relative Policy Optimization). The model learns to solve causal inference problems step-by-step across two benchmarks: CLadder (binary causal queries) and CauSciBench (continuous effect estimation).
+## What is the task
 
-## Overview
+Fine-tune a language model to solve causal inference problems by producing structured, step-by-step reasoning chains. Two benchmarks:
 
-The training pipeline teaches the model to produce structured 5-step reasoning chains:
-1. Identify causal structure (graph with arrows)
-2. Select query type or estimation method
-3. Derive the estimand
-4. Write and execute Python code
-5. Report the final answer
+- **CLadder** — binary causal queries (yes/no). Covers 10 query types: marginal, correlation, ATE, ETT, NDE, NIE, counterfactual, backdoor adjustment, collider bias, explaining away.
+- **CauSciBench** — continuous causal effect estimation. Covers 9 estimation methods: OLS, IPW, matching, DiD, RDD, IV, frontdoor, GLM, difference-in-means.
 
-GRPO generates N rollouts per prompt, scores each with a reward function, normalizes rewards within the group to advantages, and optimizes the policy with a KL-penalized objective.
+For each problem the model must produce 5 steps: (1) identify causal structure, (2) select query type or method, (3) derive the estimand or estimation spec, (4) implement and compute, (5) report the answer.
 
-## Benchmarks
+---
 
-| Benchmark | Task | Label | Query types / Methods |
-|---|---|---|---|
-| CLadder | Binary causal query (yes/no) | `yes` / `no` | 10 types (ate, ett, nde, nie, ...) |
-| CauSciBench | Causal effect estimation | continuous float | 9 methods (ols, ipw, iv, rdd, did, ...) |
+## High-level design
 
-## Dataset
+**Algorithm: GRPO (Group Relative Policy Optimization)**
 
-| Split | CLadder | CauSciBench | Total |
-|---|---|---|---|
-| train | 101,600 (synthetic) | 450 (synthetic) | 102,050 |
-| test | 10,112 (original) | 314 (original) | 10,426 |
+For each training prompt, generate N rollouts, score each with a reward function, normalize rewards within the group to advantages, and minimize the KL-penalized policy gradient loss:
 
-Synthetic CLadder examples are generated via `causalbenchmark` (47 stories × 9 query types). Synthetic CauSciBench examples are generated via `causci_bench` generators with GPT context.
+```
+loss = -mean(advantage * log_prob_policy) + β * KL(policy || reference)
+```
 
-## Project Structure
+**Policy:** Qwen3-14B with LoRA adapters (r=32, all attention + MLP projections). Reference logprobs come from the same base weights with adapters temporarily disabled — no second model copy needed.
+
+**Judge:** DeepSeek-Math-7B-Instruct at 4-bit, frozen. Used to score step 3 (estimand / estimation spec) where exact matching is impossible. All other steps use heuristics.
+
+**Reward design:**
+- CLadder: cascading −100 penalty per failed step (wrong query type → step 3 also penalized)
+- CauSciBench: independent −50 per failed step; numeric answer scored by relative error tiers (≤10% → 30 pts, ≤25% → 20, ≤50% → 10, else −50)
+
+**Dataset:** 102,050 synthetic training examples (101,600 CLadder via `causalbenchmark`, 450 CauSciBench via `causci_bench` + GPT context). Test set: 10,426 original benchmark examples held out entirely.
+
+**Multi-GPU:** On 2 GPUs, generation (GPU 0) and reference logprob + reward computation (GPU 1) are pipelined to overlap.
+
+---
+
+## Codebase structure
 
 ```
 src/
+  config.py               — single source of truth: model names, paths, all hyperparameters
+
   data/
-    data.py               — load CLadder (HuggingFace) and CauSciBench (local JSON), prompt templates
-    synthetic_cladder.py  — generate synthetic CLadder examples
-    synthetic_causci.py   — generate synthetic CauSciBench examples
-    build_dataset.py      — orchestrate all 4 sources → dataset/unified.jsonl
-    split_dataset.py      — split into dataset/train.jsonl + dataset/test.jsonl
-    preprocess.py         — rebuild prompts, normalize labels → output/train.jsonl + output/test.jsonl
+    data.py               — load CLadder (HuggingFace) + CauSciBench (local JSON), prompt templates
+    synthetic_cladder.py  — generate synthetic CLadder via causalbenchmark + RandomBuilder
+    synthetic_causci.py   — generate synthetic CauSciBench via causci_bench generators + GPT context
+    build_dataset.py      — orchestrate all 4 sources → dataset/unified.jsonl (checkpointed)
+    split_dataset.py      — split unified.jsonl → dataset/train.jsonl + dataset/test.jsonl
+    preprocess.py         — rebuild prompts with updated templates, normalize labels → output/
+
   eval/
-    sandbox.py            — subprocess code executor (120s timeout, ThreadPoolExecutor)
-    parser.py             — parse model completions into per-step fields
-    metrics.py            — per-step scoring, LLM judge for CLadder step3, aggregate metrics
-    eval.py               — entry point: batched generation → parse → sandbox → score → write results
+    parser.py             — extract per-step fields from completions via regex
+    metrics.py            — per-step scoring + DeepSeek-Math judge + aggregate metrics
+    eval.py               — entry point: load model → generate → parse → score → write results
+
   training/
-    reward.py             — reward functions for GRPO (CLadder cascading, CauSciBench independent)
-    train.py              — GRPO loop with LoRA, gradient checkpointing, single-model reference
+    reward.py             — reward functions (heuristics + batched judge calls)
+    train.py              — GRPO loop: LoRA policy, gradient checkpointing, single/multi-GPU
 
 dataset/
   unified.jsonl           — 112,476 combined examples
-  train.jsonl             — 102,050 synthetic examples
-  test.jsonl              — 10,426 original benchmark examples
+  train.jsonl             — 102,050 synthetic
+  test.jsonl              — 10,426 original benchmarks
 
 output/
-  train.jsonl             — preprocessed train set (updated prompts + normalized labels)
-  test.jsonl              — preprocessed test set
-  eval/                   — baseline eval results (results.jsonl, metrics.json)
-  eval_post_grpo/         — post-training eval results
-  checkpoints/            — LoRA checkpoints (step_N/, final/)
-
-train.ipynb               — end-to-end notebook: data → inspect → reward check → train → eval
+  train.jsonl             — preprocessed train (rebuilt prompts, normalized labels)
+  test.jsonl              — preprocessed test
+  checkpoints/            — LoRA checkpoints: step_N/, epoch_N/, final/
+  eval/                   — baseline eval: results.jsonl, metrics.json
+  eval_post_grpo/         — post-training eval
 ```
 
-## Setup
+---
 
-Requires Python 3.10 (`pomegranate==0.14.8` breaks on 3.11+).
+## How to run training
 
 ```bash
-conda create -n alignment python=3.10
-conda activate alignment
-pip install -r requirements.txt
-
-# GPU node additionally needs:
-pip install torch transformers peft accelerate
+python src/training/train.py
 ```
 
-Register CauSciBench as a local package (no setup.py):
-```bash
-echo "/path/to/causal_alignment/original_data/CauSciBench" \
-  > $(python -c "import site; print(site.getsitepackages()[0])")/causci_bench.pth
-```
+No arguments. Everything is configured in `src/config.py` — model, hyperparameters, paths.
 
-Set your OpenAI API key (used for synthetic CauSciBench generation and the CLadder step3 LLM judge):
-```bash
-export OPENAI_API_KEY=sk-...
-```
+Auto-resume: on startup, scans `output/checkpoints/` for the latest `step_N/` checkpoint and resumes from there. If none exists, starts fresh from `POLICY_MODEL`. Checkpoints are saved every `SAVE_EVERY` steps and at the end of each epoch. Final weights land in `output/checkpoints/final/`.
 
-## Run Order
+---
+
+## How to do eval
 
 ```bash
-# 1. Build dataset (all 4 sources, checkpointed)
-python src/data/build_dataset.py
-
-# 2. Split into train/test
-python src/data/split_dataset.py
-
-# 3. Preprocess (rebuild prompts, normalize labels)
-python src/data/preprocess.py
-
-# 4. Baseline eval (requires GPU, ~10k rows)
-python src/eval/eval.py --model Qwen/Qwen3-14B --workers 8
-
-# 5. GRPO training
-python src/training/train.py --model Qwen/Qwen3-14B
-
-# Resume from checkpoint
-python src/training/train.py --resume output/checkpoints/step_500
-
-# 6. Post-training eval
-python src/eval/eval.py --model output/checkpoints/final --output-dir output/eval_post_grpo
+python src/eval/eval.py
 ```
 
-For a guided run with inspection at each stage, use `train.ipynb`.
+Loads the trained model from `output/checkpoints/final` (set via `EVAL_MODEL` in `src/config.py`). Runs greedy generation over `output/test.jsonl`, scores each row, and writes results to `output/eval/`.
 
-## Reward Functions
+```bash
+# Smoke test on first N rows
+python src/eval/eval.py --limit 50
+```
 
-**CLadder** (max 100, cascading −100 penalty per failed step):
+Output: `output/eval/results.jsonl` (per-row) and `output/eval/metrics.json` (aggregated). The terminal prints a summary table broken down by query type (CLadder) and method (CauSciBench).
 
-| Step | Points | Criterion |
-|---|---|---|
-| 1: Graph | 11 | at least one `->` arrow |
-| 2: Query type | 15 | exact match to known type |
-| 3: Estimand | 24 | non-empty with math notation; cascades from step 2 |
-| 4: Code | 30 | executes and produces `result=` |
-| 5: Answer | 20 | `yes`/`no` exact match |
+**CLadder scoring (70 pts max):** step 1 structure (11) + step 2 query type (15) + step 3 estimand via judge (24) + step 5 answer (20)
 
-**CauSciBench** (max 100, independent −50 penalty per failed step):
-
-| Step | Points | Criterion |
-|---|---|---|
-| 1: Variables | 30 | treatment(5) + outcome(5) + controls Jaccard(15) + special var(5) |
-| 2: Method | 30 | exact match to known method |
-| 3: Spec | — | no ground truth, skipped |
-| 4: Code | 10 | executes and produces `result=` |
-| 5: Numeric | 30 | relative error ≤10%→30, ≤25%→20, ≤50%→10, else −50 |
-
-## Key Hyperparameters
-
-| Parameter | Value |
-|---|---|
-| Base model | Qwen/Qwen3-14B |
-| LoRA rank | 16 |
-| LoRA α | 32 |
-| KL coefficient β | 0.01 |
-| Rollouts per prompt (N) | 8 |
-| Learning rate | 2e-5 |
-| Gradient accumulation | 8 |
-| Generation temperature | 0.8 |
-| Max new tokens | 2048 |
-
-LoRA adapters are applied to all attention and MLP projection layers (~20M trainable params out of 14B). Reference logprobs are computed by temporarily disabling adapters (`model.disable_adapter_layers()`), avoiding a second 28GB model copy.
+**CauSciBench scoring (60 pts max):** step 1 variables (5) + step 2 method (5) + step 3 spec via judge (15) + step 5 numeric answer (30) + exact within 1% (5)

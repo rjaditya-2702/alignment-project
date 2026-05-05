@@ -1,13 +1,13 @@
 """
 Evaluation pipeline for causal alignment.
 
-Loads output/test.jsonl, generates completions from the policy model (greedy, temp=0),
+Loads output/test.jsonl, generates completions from the trained policy model (greedy, temp=0),
 parses per-step outputs, scores each row using heuristics + DeepSeek-Math judge,
-and writes results + aggregate metrics.
+and writes results + aggregate metrics to EVAL_OUTPUT.
 
 Usage:
-    python src/eval/eval.py [--limit N] [--model MODEL] [--output-dir OUTPUT_DIR]
-    python src/eval/eval.py --model output/checkpoints/final --output-dir output/eval_post_grpo
+    python src/eval/eval.py
+    python src/eval/eval.py --limit 50
 """
 
 import argparse
@@ -22,19 +22,18 @@ sys.path.insert(0, str(ROOT))
 from src.eval.metrics import aggregate_metrics, score_causcibench, score_cladder
 from src.eval.parser import parse_completion
 from src.config import (
-    POLICY_MODEL as DEFAULT_MODEL,
     JUDGE_MODEL,
     EVAL_BATCH_SIZE as BATCH_SIZE,
     EVAL_MAX_TOKENS,
+    EVAL_MODEL,
+    TEST_DATA,
+    EVAL_OUTPUT,
 )
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-
-TEST_DATA  = ROOT / "output" / "test.jsonl"
-OUTPUT_DIR = ROOT / "output" / "eval"
 
 GENERATION_KWARGS = dict(
     max_new_tokens=EVAL_MAX_TOKENS,
@@ -51,15 +50,15 @@ JUDGE_QUANT_CONFIG = BitsAndBytesConfig(
 
 # ── Model loading ──────────────────────────────────────────────────────────────
 
-def load_model(model_name: str):
-    print(f"Loading tokenizer: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+def load_model(model_path):
+    print(f"Loading tokenizer: {model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading model: {model_name}")
+    print(f"Loading model: {model_path}")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        model_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
@@ -88,14 +87,14 @@ def load_judge(model_name: str):
 
 # ── Generation ─────────────────────────────────────────────────────────────────
 
-def generate_completions(prompts: list[str], model, tokenizer, batch_size: int = BATCH_SIZE) -> list[str]:
+def generate_completions(prompts: list[str], model, tokenizer) -> list[str]:
     completions = []
     device = next(model.parameters()).device
 
-    for i in range(0, len(prompts), batch_size):
-        batch_prompts = prompts[i : i + batch_size]
-        if (i // batch_size) % 10 == 0:
-            print(f"  Generating batch {i // batch_size + 1} / {math.ceil(len(prompts) / batch_size)}", flush=True)
+    for i in range(0, len(prompts), BATCH_SIZE):
+        batch_prompts = prompts[i : i + BATCH_SIZE]
+        if (i // BATCH_SIZE) % 10 == 0:
+            print(f"  Generating batch {i // BATCH_SIZE + 1} / {math.ceil(len(prompts) / BATCH_SIZE)}", flush=True)
 
         inputs = tokenizer(
             batch_prompts,
@@ -157,13 +156,10 @@ def run_eval(rows: list[dict], model, tokenizer, judge_model, judge_tokenizer) -
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit",      type=int, default=None, help="Eval only first N rows")
-    parser.add_argument("--model",      type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
+    parser.add_argument("--limit", type=int, default=None, help="Eval only first N rows")
     args = parser.parse_args()
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    EVAL_OUTPUT.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading test data from {TEST_DATA}")
     with open(TEST_DATA) as f:
@@ -172,19 +168,20 @@ def main():
         rows = rows[:args.limit]
     print(f"  {len(rows)} rows loaded")
 
-    model, tokenizer          = load_model(args.model)
+    print(f"Eval model: {EVAL_MODEL}")
+    model, tokenizer             = load_model(EVAL_MODEL)
     judge_model, judge_tokenizer = load_judge(JUDGE_MODEL)
 
     results = run_eval(rows, model, tokenizer, judge_model, judge_tokenizer)
 
-    results_path = out_dir / "results.jsonl"
+    results_path = EVAL_OUTPUT / "results.jsonl"
     with open(results_path, "w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
     print(f"\nWrote {len(results)} results → {results_path}")
 
     metrics = aggregate_metrics(results)
-    metrics_path = out_dir / "metrics.json"
+    metrics_path = EVAL_OUTPUT / "metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"Wrote metrics → {metrics_path}")

@@ -1,10 +1,22 @@
-# Central config — change POLICY_MODEL here and train.py + eval.py both pick it up.
-# All other hyperparameters live here too.
+# Central config — all models, hyperparameters, and paths live here.
+# Change anything here and every script picks it up automatically.
+
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
 POLICY_MODEL = "Qwen/Qwen3-14B"
 JUDGE_MODEL  = "deepseek-ai/deepseek-math-7b-instruct"
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+TRAIN_DATA     = ROOT / "output" / "train.jsonl"
+TEST_DATA      = ROOT / "output" / "test.jsonl"
+CHECKPOINT_DIR = ROOT / "output" / "checkpoints"
+EVAL_MODEL     = ROOT / "output" / "checkpoints" / "final"  # eval loads from here
+EVAL_OUTPUT    = ROOT / "output" / "eval"
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
 

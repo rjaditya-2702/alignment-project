@@ -18,13 +18,14 @@ Multi-GPU pipeline (2+ GPUs):
   Pipeline: GPU 0 generates batch_i while GPU 1 computes ref+judge for batch_{i-1}.
   Within each iteration: GPU 0 policy logprobs and GPU 1 ref+judge also overlap.
 
+Resume:
+  Automatically resumes from the latest step_N checkpoint in CHECKPOINT_DIR.
+  Reference model is always loaded from the base POLICY_MODEL weights.
+
 Usage:
     python src/training/train.py
-    python src/training/train.py --model Qwen/Qwen3-14B --n-rollouts 8 --batch-size 4
-    python src/training/train.py --resume output/checkpoints/step_500
 """
 
-import argparse
 import json
 import queue as queue_module
 import random
@@ -42,8 +43,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import BitsAndBytesConfig
 from src.training.reward import compute_rewards
 from src.config import (
-    POLICY_MODEL as DEFAULT_MODEL,
+    POLICY_MODEL,
     JUDGE_MODEL,
+    TRAIN_DATA,
+    CHECKPOINT_DIR,
     TRAIN_BATCH_SIZE as BATCH_SIZE,
     N_ROLLOUTS,
     MAX_PROMPT_LEN,
@@ -60,11 +63,6 @@ from src.config import (
     LOG_EVERY,
     LORA_R as R,
 )
-
-# ── Paths ─────────────────────────────────────────────────────────────────────
-
-TRAIN_DATA = ROOT / "output" / "train.jsonl"
-OUTPUT_DIR = ROOT / "output" / "checkpoints"
 
 # ── LoRA / quant configs ──────────────────────────────────────────────────────
 
@@ -87,6 +85,24 @@ REF_QUANT_CONFIG = BitsAndBytesConfig(
     load_in_8bit=True,
     bnb_8bit_compute_dtype=torch.bfloat16,
 )
+
+
+# ── Checkpoint resume ─────────────────────────────────────────────────────────
+
+def _find_latest_checkpoint(out_dir: Path) -> tuple[Path | None, int]:
+    """Return (path, global_step) of the latest step_N checkpoint, or (None, 0)."""
+    latest_step = 0
+    latest_ckpt = None
+    for p in out_dir.glob("step_*"):
+        if p.is_dir():
+            try:
+                step = int(p.name.split("_")[1])
+                if step > latest_step:
+                    latest_step = step
+                    latest_ckpt = p
+            except (IndexError, ValueError):
+                pass
+    return latest_ckpt, latest_step
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -259,11 +275,10 @@ def grpo_loss(
     policy_lps: torch.Tensor,   # [N]
     ref_lps: torch.Tensor,      # [N], detached
     rewards: torch.Tensor,      # [N]
-    beta: float = BETA,
 ) -> torch.Tensor:
     adv = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
     kl  = policy_lps - ref_lps
-    return -(adv * policy_lps).mean() + beta * kl.mean()
+    return -(adv * policy_lps).mean() + BETA * kl.mean()
 
 
 # ── Tokenization helpers ──────────────────────────────────────────────────────
@@ -342,47 +357,53 @@ def _ref_judge_worker(
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train(args):
+def train():
     n_gpu = torch.cuda.device_count()
     print(f"Detected {n_gpu} CUDA GPU(s)")
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+    resume_ckpt, start_step = _find_latest_checkpoint(CHECKPOINT_DIR)
+    if resume_ckpt:
+        print(f"Resuming from {resume_ckpt} (step {start_step})")
+    else:
+        print(f"No checkpoint found — starting fresh from {POLICY_MODEL}")
 
     with open(TRAIN_DATA) as f:
         all_rows = [json.loads(l) for l in f]
     print(f"Loaded {len(all_rows)} training rows")
 
     if n_gpu >= 2:
-        _train_multi_gpu(args, all_rows, out_dir)
+        _train_multi_gpu(all_rows, CHECKPOINT_DIR, resume_ckpt, start_step)
     else:
-        _train_single_gpu(args, all_rows, out_dir)
+        _train_single_gpu(all_rows, CHECKPOINT_DIR, resume_ckpt, start_step)
 
 
-def _train_single_gpu(args, all_rows, out_dir):
-    model, tokenizer             = load_policy(args.resume or args.model)
+def _train_single_gpu(all_rows, out_dir, resume_ckpt, start_step):
+    policy_model_path = str(resume_ckpt) if resume_ckpt else POLICY_MODEL
+    model, tokenizer             = load_policy(policy_model_path)
     judge_model, judge_tokenizer = load_judge(JUDGE_MODEL)
     device = str(next(model.parameters()).device)
     pad_id = tokenizer.pad_token_id
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
+        lr=LR,
         weight_decay=WEIGHT_DECAY,
     )
 
-    global_step = 0
+    global_step = start_step
 
-    for epoch in range(args.epochs):
+    for epoch in range(MAX_EPOCHS):
         random.shuffle(all_rows)
         optimizer.zero_grad()
         accum_loss = accum_reward = 0.0
         n_accum = 0
 
-        for batch_start in range(0, len(all_rows), args.batch_size):
-            batch = all_rows[batch_start : batch_start + args.batch_size]
+        for batch_start in range(0, len(all_rows), BATCH_SIZE):
+            batch = all_rows[batch_start : batch_start + BATCH_SIZE]
             B     = len(batch)
-            N     = args.n_rollouts
+            N     = N_ROLLOUTS
 
             # 1. Generate rollouts
             model.eval()
@@ -419,27 +440,25 @@ def _train_single_gpu(args, all_rows, out_dir):
             for b in range(B):
                 if rewards[b].std() < 1e-6:
                     continue
-                losses.append(
-                    grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b], beta=args.beta)
-                )
+                losses.append(grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b]))
 
             if not losses:
                 continue
 
             loss = torch.stack(losses).mean()
-            (loss / args.grad_accum).backward()
+            (loss / GRAD_ACCUM).backward()
 
             accum_loss   += loss.item()
             accum_reward += rewards.mean().item()
             n_accum      += 1
             global_step  += 1
 
-            if global_step % args.grad_accum == 0:
+            if global_step % GRAD_ACCUM == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if global_step % args.log_every == 0 and n_accum > 0:
+            if global_step % LOG_EVERY == 0 and n_accum > 0:
                 print(
                     f"epoch={epoch+1}  step={global_step:>6}  "
                     f"loss={accum_loss/n_accum:.4f}  "
@@ -449,7 +468,7 @@ def _train_single_gpu(args, all_rows, out_dir):
                 accum_loss = accum_reward = 0.0
                 n_accum = 0
 
-            if global_step % args.save_every == 0:
+            if global_step % SAVE_EVERY == 0:
                 ckpt = out_dir / f"step_{global_step}"
                 model.save_pretrained(ckpt)
                 tokenizer.save_pretrained(ckpt)
@@ -466,7 +485,7 @@ def _train_single_gpu(args, all_rows, out_dir):
     print(f"Training complete → {final}")
 
 
-def _train_multi_gpu(args, all_rows, out_dir):
+def _train_multi_gpu(all_rows, out_dir, resume_ckpt, start_step):
     """
     Pipelined 2-GPU training.
 
@@ -481,10 +500,11 @@ def _train_multi_gpu(args, all_rows, out_dir):
     policy_device = "cuda:0"
     ref_device    = "cuda:1"
 
-    # Policy on GPU 0; reference model always loaded from base (not checkpoint)
+    # Policy loads from checkpoint if resuming; reference always loads from base weights
     # so it represents the pre-training distribution regardless of resume state.
-    model, tokenizer = load_policy(args.resume or args.model, policy_device)
-    ref_model        = load_ref_model(args.model, ref_device)
+    policy_model_path = str(resume_ckpt) if resume_ckpt else POLICY_MODEL
+    model, tokenizer             = load_policy(policy_model_path, policy_device)
+    ref_model                    = load_ref_model(POLICY_MODEL, ref_device)
     judge_model, judge_tokenizer = load_judge(JUDGE_MODEL, ref_device)
 
     pad_id = tokenizer.pad_token_id
@@ -502,21 +522,21 @@ def _train_multi_gpu(args, all_rows, out_dir):
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
+        lr=LR,
         weight_decay=WEIGHT_DECAY,
     )
 
-    global_step = 0
+    global_step = start_step
 
-    for epoch in range(args.epochs):
+    for epoch in range(MAX_EPOCHS):
         random.shuffle(all_rows)
         optimizer.zero_grad()
         accum_loss = accum_reward = 0.0
         n_accum = 0
 
         batches = [
-            all_rows[s : s + args.batch_size]
-            for s in range(0, len(all_rows), args.batch_size)
+            all_rows[s : s + BATCH_SIZE]
+            for s in range(0, len(all_rows), BATCH_SIZE)
         ]
 
         # Rolling state for the previous batch (processed one step behind)
@@ -526,7 +546,7 @@ def _train_multi_gpu(args, all_rows, out_dir):
         prev_N              = None
 
         for i, batch in enumerate(batches):
-            N = args.n_rollouts
+            N = N_ROLLOUTS
 
             # ── Overlap A: generate batch_i on GPU 0 ─────────────────────
             # GPU 1 worker is already processing prev batch from last iter's enqueue.
@@ -569,25 +589,25 @@ def _train_multi_gpu(args, all_rows, out_dir):
                     ).view(B_prev, prev_N).detach()
 
                     losses = [
-                        grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b], beta=args.beta)
+                        grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b])
                         for b in range(B_prev) if rewards[b].std() >= 1e-6
                     ]
 
                     if losses:
                         loss = torch.stack(losses).mean()
-                        (loss / args.grad_accum).backward()
+                        (loss / GRAD_ACCUM).backward()
 
                         accum_loss   += loss.item()
                         accum_reward += rewards.mean().item()
                         n_accum      += 1
                         global_step  += 1
 
-                        if global_step % args.grad_accum == 0:
+                        if global_step % GRAD_ACCUM == 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                             optimizer.step()
                             optimizer.zero_grad()
 
-                        if global_step % args.log_every == 0 and n_accum > 0:
+                        if global_step % LOG_EVERY == 0 and n_accum > 0:
                             print(
                                 f"epoch={epoch+1}  step={global_step:>6}  "
                                 f"loss={accum_loss/n_accum:.4f}  "
@@ -597,7 +617,7 @@ def _train_multi_gpu(args, all_rows, out_dir):
                             accum_loss = accum_reward = 0.0
                             n_accum = 0
 
-                        if global_step % args.save_every == 0:
+                        if global_step % SAVE_EVERY == 0:
                             ckpt = out_dir / f"step_{global_step}"
                             model.save_pretrained(ckpt)
                             tokenizer.save_pretrained(ckpt)
@@ -632,16 +652,16 @@ def _train_multi_gpu(args, all_rows, out_dir):
                 ).view(B_prev, prev_N).detach()
 
                 losses = [
-                    grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b], beta=args.beta)
+                    grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b])
                     for b in range(B_prev) if rewards[b].std() >= 1e-6
                 ]
 
                 if losses:
                     loss = torch.stack(losses).mean()
-                    (loss / args.grad_accum).backward()
+                    (loss / GRAD_ACCUM).backward()
                     global_step += 1
 
-                    if global_step % args.grad_accum == 0:
+                    if global_step % GRAD_ACCUM == 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                         optimizer.step()
                         optimizer.zero_grad()
@@ -663,22 +683,5 @@ def _train_multi_gpu(args, all_rows, out_dir):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model",       default=DEFAULT_MODEL)
-    parser.add_argument("--resume",      default=None,         help="Resume from checkpoint dir")
-    parser.add_argument("--output-dir",  default=str(OUTPUT_DIR))
-    parser.add_argument("--epochs",      type=int,   default=MAX_EPOCHS)
-    parser.add_argument("--batch-size",  type=int,   default=BATCH_SIZE,  help="Prompts per training step")
-    parser.add_argument("--n-rollouts",  type=int,   default=N_ROLLOUTS)
-    parser.add_argument("--beta",        type=float, default=BETA)
-    parser.add_argument("--lr",          type=float, default=LR)
-    parser.add_argument("--grad-accum",  type=int,   default=GRAD_ACCUM)
-    parser.add_argument("--save-every",  type=int,   default=SAVE_EVERY)
-    parser.add_argument("--log-every",   type=int,   default=LOG_EVERY)
-    args = parser.parse_args()
-    train(args)
-
-
 if __name__ == "__main__":
-    main()
+    train()
