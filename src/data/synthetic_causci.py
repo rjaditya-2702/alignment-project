@@ -158,12 +158,6 @@ Return ONLY a valid JSON object (no markdown):
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     )
-    # text = response.choices[0].message.content.strip()
-    # if text.startswith("```"):
-    #     lines = text.split("\n")
-    #     text = "\n".join(lines[1:])
-    #     if text.endswith("```"):
-    #         text = text[:-3].strip()
     return json.loads(response.choices[0].message.content.strip())
 
 
@@ -282,5 +276,5 @@ if __name__ == "__main__":
     print(f"id:     {ex['id']}")
     print(f"label:  {ex['label']:.4f}")
     print(f"step1:  {ex['groundtruth']['step1']}")
-    print(f"query:  {ex['groundtruth']['step1']}")
+    print(f"method: {ex['groundtruth']['step2']}")
     print(f"prompt[:300]:\n{ex['prompt'][:300]}")

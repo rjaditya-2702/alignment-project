@@ -23,13 +23,13 @@ from collections import defaultdict
 
 # ── LLM judge (DeepSeek-Math) ─────────────────────────────────────────────────
 
-_CLADDER_JUDGE_SYSTEM = (
+CLADDER_JUDGE_SYSTEM = (
     "You are an expert in causal inference. "
     "Score whether a predicted estimand expression is semantically equivalent to the reference. "
     "Reply with a single integer only: 0 (wrong or missing), 1 (partially correct), 2 (correct)."
 )
 
-_CAUSCI_JUDGE_SYSTEM = (
+CAUSCI_JUDGE_SYSTEM = (
     "You are an expert in causal inference. "
     "Score whether the estimation specification is appropriate for the given method and identified variables. "
     "Reply with a single integer only: 0 (inappropriate), 1 (partially appropriate), 2 (appropriate)."
@@ -70,7 +70,7 @@ def judge_estimand(predicted: str, reference: str, judge_model, judge_tokenizer)
     if not predicted.strip():
         return 0
     user_msg = f"Reference: {reference}\nPredicted: {predicted}\nScore:"
-    prompt = _format_prompt(_CLADDER_JUDGE_SYSTEM, user_msg, judge_tokenizer)
+    prompt = _format_prompt(CLADDER_JUDGE_SYSTEM, user_msg, judge_tokenizer)
     return _run_judge(prompt, judge_model, judge_tokenizer)
 
 
@@ -79,7 +79,7 @@ def judge_spec(spec: str, method: str, step1: str, judge_model, judge_tokenizer)
     if not spec.strip():
         return 0
     user_msg = f"Method: {method}\nVariables identified: {step1}\nSpecification: {spec}\nScore:"
-    prompt = _format_prompt(_CAUSCI_JUDGE_SYSTEM, user_msg, judge_tokenizer)
+    prompt = _format_prompt(CAUSCI_JUDGE_SYSTEM, user_msg, judge_tokenizer)
     return _run_judge(prompt, judge_model, judge_tokenizer)
 
 

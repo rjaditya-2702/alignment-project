@@ -2,7 +2,8 @@
 GRPO post-training for causal alignment.
 
 Policy:    Qwen3-14B + LoRA — trainable
-Reference: same base weights with adapters disabled — frozen
+Reference: same base weights with adapters disabled — frozen (single GPU)
+           OR separate 8-bit base model on GPU 1 (multi-GPU)
 
 Algorithm:
   For each batch of B prompts, generate N rollouts each (B*N total).
@@ -10,6 +11,12 @@ Algorithm:
   Normalize rewards within each prompt's group of N: â = (r - mean) / std.
   GRPO loss = mean over valid groups of [-mean(â * logprob) + β * KL(policy || ref)]
   Logprobs computed in one batched forward pass per model (policy and ref separately).
+
+Multi-GPU pipeline (2+ GPUs):
+  GPU 0: policy (generation + policy logprobs + backward)
+  GPU 1: reference model (8-bit) + judge (reference logprobs + rewards)
+  Pipeline: GPU 0 generates batch_i while GPU 1 computes ref+judge for batch_{i-1}.
+  Within each iteration: GPU 0 policy logprobs and GPU 1 ref+judge also overlap.
 
 Usage:
     python src/training/train.py
@@ -19,8 +26,10 @@ Usage:
 
 import argparse
 import json
+import queue as queue_module
 import random
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,32 +41,32 @@ from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import BitsAndBytesConfig
 from src.training.reward import compute_rewards
+from src.config import (
+    POLICY_MODEL as DEFAULT_MODEL,
+    JUDGE_MODEL,
+    TRAIN_BATCH_SIZE as BATCH_SIZE,
+    N_ROLLOUTS,
+    MAX_PROMPT_LEN,
+    TRAIN_MAX_TOKENS as MAX_NEW_TOKENS,
+    TEMPERATURE,
+    TOP_P,
+    BETA,
+    LR,
+    WEIGHT_DECAY,
+    GRAD_ACCUM,
+    MAX_GRAD_NORM,
+    MAX_EPOCHS,
+    SAVE_EVERY,
+    LOG_EVERY,
+    LORA_R as R,
+)
 
-# ── Hyperparameters ───────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL   = "Qwen/Qwen3-14B"
-JUDGE_MODEL     = "deepseek-ai/deepseek-math-7b-instruct"
-TRAIN_DATA      = ROOT / "output" / "train.jsonl"
-OUTPUT_DIR      = ROOT / "output" / "checkpoints"
+TRAIN_DATA = ROOT / "output" / "train.jsonl"
+OUTPUT_DIR = ROOT / "output" / "checkpoints"
 
-BATCH_SIZE      = 4       # prompts per training step
-N_ROLLOUTS      = 8       # completions per prompt
-MAX_PROMPT_LEN  = 3072    # truncate prompt to this many tokens
-MAX_NEW_TOKENS  = 2048    # max completion length
-TEMPERATURE     = 0.8
-TOP_P           = 0.9
-
-BETA            = 0.01    # KL coefficient
-LR              = 2e-5
-WEIGHT_DECAY    = 0.01
-GRAD_ACCUM      = 8       # optimizer step every N steps
-MAX_GRAD_NORM   = 1.0
-
-MAX_EPOCHS      = 3
-SAVE_EVERY      = 500     # global steps between checkpoints
-LOG_EVERY       = 10      # global steps between log lines
-
-R = 32
+# ── LoRA / quant configs ──────────────────────────────────────────────────────
 
 LORA_CONFIG = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
@@ -69,24 +78,20 @@ LORA_CONFIG = LoraConfig(
     bias="none",
 )
 
-QUANT_CONFIG = BitsAndBytesConfig(
-    load_in_8bit=True,
-    bnb_8bit_quant_type="nf4",
-    bnb_8bit_compute_dtype=torch.bfloat16,
-    bnb_8bit_use_double_quant=True,
-)
-
-# QUANT_CONFIG = None
-
 JUDGE_QUANT_CONFIG = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.bfloat16,
 )
 
+REF_QUANT_CONFIG = BitsAndBytesConfig(
+    load_in_8bit=True,
+    bnb_8bit_compute_dtype=torch.bfloat16,
+)
+
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
-def load_policy(model_name: str):
+def load_policy(model_name: str, device: str = None):
     print(f"Loading tokenizer from {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -96,12 +101,13 @@ def load_policy(model_name: str):
             tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     tokenizer.padding_side = "left"
 
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     print(f"Loading model from {model_name} → {device}")
     base = AutoModelForCausalLM.from_pretrained(
@@ -120,18 +126,32 @@ def load_policy(model_name: str):
     return model, tokenizer
 
 
-def load_judge(model_name: str):
+def load_ref_model(model_name: str, device: str):
+    """Load base weights only (no LoRA), 8-bit quantized, on the given device."""
+    print(f"Loading reference model from {model_name} on {device} (8-bit)")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=None, # for now. replace with REF_QUANT_CONFIG later.
+        device_map={"": device},
+        trust_remote_code=True,
+    )
+    model.eval()
+    return model
+
+
+def load_judge(model_name: str, device: str = None):
     print(f"Loading judge tokenizer from {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    print(f"Loading judge model from {model_name} (4-bit)")
+    device_map = {"": device} if device is not None else "auto"
+    print(f"Loading judge model from {model_name} (4-bit, device={device_map})")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=JUDGE_QUANT_CONFIG,
-        device_map="auto",
+        device_map=device_map,
         trust_remote_code=True,
     )
     model.eval()
@@ -180,7 +200,6 @@ def generate_batch_rollouts(
             num_return_sequences=n,
             pad_token_id=tokenizer.pad_token_id,
         )
-    # out_ids: [B*N, seq_len] — all N rollouts for prompt 0 first, then prompt 1, etc.
     prompt_len = enc["input_ids"].shape[1]
     return [
         tokenizer.decode(out[prompt_len:], skip_special_tokens=True)
@@ -247,9 +266,86 @@ def grpo_loss(
     return -(adv * policy_lps).mean() + beta * kl.mean()
 
 
+# ── Tokenization helpers ──────────────────────────────────────────────────────
+
+def _tokenize_prompts_cpu(tokenizer, batch, N):
+    """Tokenize each prompt N times; return list of CPU tensors (length B*N)."""
+    result = []
+    for row in batch:
+        ids = tokenizer(
+            row["prompt"],
+            return_tensors="pt",
+            truncation=True,
+            max_length=MAX_PROMPT_LEN,
+            add_special_tokens=True,
+        ).input_ids[0]
+        for _ in range(N):
+            result.append(ids)
+    return result
+
+
+def _tokenize_completions_cpu(tokenizer, completions):
+    """Tokenize completions; return list of CPU tensors."""
+    return [
+        tokenizer(
+            c,
+            return_tensors="pt",
+            add_special_tokens=False,
+            truncation=True,
+            max_length=MAX_NEW_TOKENS,
+        ).input_ids[0]
+        for c in completions
+    ]
+
+
+# ── Multi-GPU pipeline worker ─────────────────────────────────────────────────
+
+def _ref_judge_worker(
+    ref_model,
+    judge_model,
+    judge_tokenizer,
+    pad_id: int,
+    ref_device: str,
+    gen_q: queue_module.Queue,
+    result_q: queue_module.Queue,
+):
+    """
+    GPU 1 worker thread.
+    Receives (batch, completions, prompt_ids_cpu, comp_ids_cpu) from gen_q.
+    Computes reference logprobs and rewards, puts (batch, ref_lps_cpu, rewards_list)
+    in result_q. Exits on None sentinel.
+    """
+    while True:
+        item = gen_q.get()
+        if item is None:
+            return
+
+        batch, completions, prompt_ids_cpu, comp_ids_cpu = item
+        N = len(completions) // len(batch)
+        flat_rows = [r for r in batch for _ in range(N)]
+
+        prompt_ids = [t.to(ref_device) for t in prompt_ids_cpu]
+        comp_ids   = [t.to(ref_device) for t in comp_ids_cpu]
+
+        with torch.no_grad():
+            ref_lps_flat = batched_sequence_logprobs(
+                ref_model, prompt_ids, comp_ids, pad_id
+            )
+
+        rewards_list = compute_rewards(
+            completions, flat_rows, judge_model, judge_tokenizer
+        )
+
+        ref_lps_cpu = [lp.cpu() for lp in ref_lps_flat]
+        result_q.put((batch, ref_lps_cpu, rewards_list))
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(args):
+    n_gpu = torch.cuda.device_count()
+    print(f"Detected {n_gpu} CUDA GPU(s)")
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -257,9 +353,17 @@ def train(args):
         all_rows = [json.loads(l) for l in f]
     print(f"Loaded {len(all_rows)} training rows")
 
+    if n_gpu >= 2:
+        _train_multi_gpu(args, all_rows, out_dir)
+    else:
+        _train_single_gpu(args, all_rows, out_dir)
+
+
+def _train_single_gpu(args, all_rows, out_dir):
     model, tokenizer             = load_policy(args.resume or args.model)
     judge_model, judge_tokenizer = load_judge(JUDGE_MODEL)
-    device = next(model.parameters()).device
+    device = str(next(model.parameters()).device)
+    pad_id = tokenizer.pad_token_id
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -267,7 +371,7 @@ def train(args):
         weight_decay=WEIGHT_DECAY,
     )
 
-    global_step  = 0
+    global_step = 0
 
     for epoch in range(args.epochs):
         random.shuffle(all_rows)
@@ -280,61 +384,34 @@ def train(args):
             B     = len(batch)
             N     = args.n_rollouts
 
-            # ── 1. Generate B*N rollouts ──────────────────────────────
+            # 1. Generate rollouts
             model.eval()
-            all_completions = generate_batch_rollouts(
-                model, tokenizer, [r["prompt"] for r in batch], N, str(device)
+            completions = generate_batch_rollouts(
+                model, tokenizer, [r["prompt"] for r in batch], N, device
             )
             model.train()
 
-            # ── 2. Compute rewards ────────────────────────────────────
+            # 2. Rewards
             flat_rows    = [r for r in batch for _ in range(N)]
-            rewards_list = compute_rewards(all_completions, flat_rows, judge_model, judge_tokenizer)
+            rewards_list = compute_rewards(completions, flat_rows, judge_model, judge_tokenizer)
             rewards      = torch.tensor(rewards_list, dtype=torch.float32, device=device).view(B, N)
-
-            # Skip batch if every group has zero variance
             if all(rewards[b].std() < 1e-6 for b in range(B)):
                 continue
 
-            # ── 3. Tokenize all prompts and completions ───────────────
-            # Each prompt repeated N times to pair with its rollouts
-            prompt_ids_list = []
-            for row in batch:
-                ids = tokenizer(
-                    row["prompt"],
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=MAX_PROMPT_LEN,
-                    add_special_tokens=True,
-                ).input_ids[0].to(device)
-                for _ in range(N):
-                    prompt_ids_list.append(ids)
+            # 3. Tokenize
+            prompt_ids_list = [t.to(device) for t in _tokenize_prompts_cpu(tokenizer, batch, N)]
+            comp_ids_list   = [t.to(device) for t in _tokenize_completions_cpu(tokenizer, completions)]
 
-            comp_ids_list = []
-            for comp in all_completions:
-                ids = tokenizer(
-                    comp,
-                    return_tensors="pt",
-                    add_special_tokens=False,
-                    truncation=True,
-                    max_length=MAX_NEW_TOKENS,
-                ).input_ids[0].to(device)
-                comp_ids_list.append(ids)
+            # 4. Policy logprobs
+            policy_lps_flat = batched_sequence_logprobs(model, prompt_ids_list, comp_ids_list, pad_id)
 
-            # ── 4. Policy logprobs — one batched forward pass ─────────
-            policy_lps_flat = batched_sequence_logprobs(
-                model, prompt_ids_list, comp_ids_list, tokenizer.pad_token_id
-            )
-
-            # ── 5. Reference logprobs — adapters off, no grad ─────────
+            # 5. Reference logprobs — adapters off, no grad
             model.disable_adapter_layers()
             with torch.no_grad():
-                ref_lps_flat = batched_sequence_logprobs(
-                    model, prompt_ids_list, comp_ids_list, tokenizer.pad_token_id
-                )
+                ref_lps_flat = batched_sequence_logprobs(model, prompt_ids_list, comp_ids_list, pad_id)
             model.enable_adapter_layers()
 
-            # ── 6. Reshape [B, N] and compute GRPO loss ───────────────
+            # 6. GRPO loss
             policy_lps_t = torch.stack(policy_lps_flat).view(B, N)
             ref_lps_t    = torch.stack(ref_lps_flat).view(B, N).detach()
 
@@ -357,13 +434,11 @@ def train(args):
             n_accum      += 1
             global_step  += 1
 
-            # ── 7. Optimizer step ─────────────────────────────────────
             if global_step % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # ── Logging ───────────────────────────────────────────────
             if global_step % args.log_every == 0 and n_accum > 0:
                 print(
                     f"epoch={epoch+1}  step={global_step:>6}  "
@@ -374,18 +449,211 @@ def train(args):
                 accum_loss = accum_reward = 0.0
                 n_accum = 0
 
-            # ── Checkpoint ────────────────────────────────────────────
             if global_step % args.save_every == 0:
                 ckpt = out_dir / f"step_{global_step}"
                 model.save_pretrained(ckpt)
                 tokenizer.save_pretrained(ckpt)
                 print(f"Saved → {ckpt}")
 
-        # End of epoch
         ckpt = out_dir / f"epoch_{epoch+1}"
         model.save_pretrained(ckpt)
         tokenizer.save_pretrained(ckpt)
         print(f"Epoch {epoch+1} complete → {ckpt}")
+
+    final = out_dir / "final"
+    model.save_pretrained(final)
+    tokenizer.save_pretrained(final)
+    print(f"Training complete → {final}")
+
+
+def _train_multi_gpu(args, all_rows, out_dir):
+    """
+    Pipelined 2-GPU training.
+
+    GPU 0: policy (Qwen3-14B + LoRA) — generation, policy logprobs, backward
+    GPU 1: reference (Qwen3-14B 8-bit, no LoRA) + judge — ref logprobs, rewards
+
+    Pipeline per iteration i:
+      [GPU 0] generate batch_i   ←→  [GPU 1] ref+judge for batch_{i-1}  (overlap A)
+      [GPU 0] policy_lp batch_{i-1}  ←→  [GPU 1] ref+judge batch_{i-1}  (overlap B)
+      [GPU 0] backward batch_{i-1}   (waits for both GPU 0 and GPU 1 to finish)
+    """
+    policy_device = "cuda:0"
+    ref_device    = "cuda:1"
+
+    # Policy on GPU 0; reference model always loaded from base (not checkpoint)
+    # so it represents the pre-training distribution regardless of resume state.
+    model, tokenizer = load_policy(args.resume or args.model, policy_device)
+    ref_model        = load_ref_model(args.model, ref_device)
+    judge_model, judge_tokenizer = load_judge(JUDGE_MODEL, ref_device)
+
+    pad_id = tokenizer.pad_token_id
+
+    gen_q    = queue_module.Queue(maxsize=2)
+    result_q = queue_module.Queue(maxsize=2)
+
+    worker = threading.Thread(
+        target=_ref_judge_worker,
+        args=(ref_model, judge_model, judge_tokenizer,
+              pad_id, ref_device, gen_q, result_q),
+        daemon=True,
+    )
+    worker.start()
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    global_step = 0
+
+    for epoch in range(args.epochs):
+        random.shuffle(all_rows)
+        optimizer.zero_grad()
+        accum_loss = accum_reward = 0.0
+        n_accum = 0
+
+        batches = [
+            all_rows[s : s + args.batch_size]
+            for s in range(0, len(all_rows), args.batch_size)
+        ]
+
+        # Rolling state for the previous batch (processed one step behind)
+        prev_batch          = None
+        prev_prompt_ids_cpu = None
+        prev_comp_ids_cpu   = None
+        prev_N              = None
+
+        for i, batch in enumerate(batches):
+            N = args.n_rollouts
+
+            # ── Overlap A: generate batch_i on GPU 0 ─────────────────────
+            # GPU 1 worker is already processing prev batch from last iter's enqueue.
+            model.eval()
+            completions_i = generate_batch_rollouts(
+                model, tokenizer, [r["prompt"] for r in batch], N, policy_device
+            )
+            model.train()
+
+            # Tokenize batch_i on CPU (fast; doesn't block either GPU)
+            prompt_ids_i_cpu = _tokenize_prompts_cpu(tokenizer, batch, N)
+            comp_ids_i_cpu   = _tokenize_completions_cpu(tokenizer, completions_i)
+
+            # Enqueue batch_i — GPU 1 will process it after finishing prev batch
+            gen_q.put((batch, completions_i, prompt_ids_i_cpu, comp_ids_i_cpu))
+
+            # ── Overlap B + backward for prev batch ───────────────────────
+            if prev_batch is not None:
+                B_prev = len(prev_batch)
+
+                # GPU 0: policy logprobs for prev batch
+                # GPU 1: simultaneously running ref+judge for prev batch (overlap B)
+                prev_prompt_ids = [t.to(policy_device) for t in prev_prompt_ids_cpu]
+                prev_comp_ids   = [t.to(policy_device) for t in prev_comp_ids_cpu]
+                policy_lps_flat = batched_sequence_logprobs(
+                    model, prev_prompt_ids, prev_comp_ids, pad_id
+                )
+
+                # Wait for GPU 1 result for prev batch (may already be in queue)
+                _, ref_lps_cpu, rewards_list = result_q.get()
+
+                rewards = torch.tensor(
+                    rewards_list, dtype=torch.float32, device=policy_device
+                ).view(B_prev, prev_N)
+
+                if not all(rewards[b].std() < 1e-6 for b in range(B_prev)):
+                    policy_lps_t = torch.stack(policy_lps_flat).view(B_prev, prev_N)
+                    ref_lps_t = torch.stack(
+                        [lp.to(policy_device) for lp in ref_lps_cpu]
+                    ).view(B_prev, prev_N).detach()
+
+                    losses = [
+                        grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b], beta=args.beta)
+                        for b in range(B_prev) if rewards[b].std() >= 1e-6
+                    ]
+
+                    if losses:
+                        loss = torch.stack(losses).mean()
+                        (loss / args.grad_accum).backward()
+
+                        accum_loss   += loss.item()
+                        accum_reward += rewards.mean().item()
+                        n_accum      += 1
+                        global_step  += 1
+
+                        if global_step % args.grad_accum == 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                            optimizer.step()
+                            optimizer.zero_grad()
+
+                        if global_step % args.log_every == 0 and n_accum > 0:
+                            print(
+                                f"epoch={epoch+1}  step={global_step:>6}  "
+                                f"loss={accum_loss/n_accum:.4f}  "
+                                f"reward={accum_reward/n_accum:.3f}",
+                                flush=True,
+                            )
+                            accum_loss = accum_reward = 0.0
+                            n_accum = 0
+
+                        if global_step % args.save_every == 0:
+                            ckpt = out_dir / f"step_{global_step}"
+                            model.save_pretrained(ckpt)
+                            tokenizer.save_pretrained(ckpt)
+                            print(f"Saved → {ckpt}")
+
+            # Roll over: current batch becomes previous for next iteration
+            prev_batch          = batch
+            prev_prompt_ids_cpu = prompt_ids_i_cpu
+            prev_comp_ids_cpu   = comp_ids_i_cpu
+            prev_N              = N
+
+        # ── Drain the final batch (enqueued in last loop iteration) ───────
+        if prev_batch is not None:
+            B_prev = len(prev_batch)
+
+            prev_prompt_ids = [t.to(policy_device) for t in prev_prompt_ids_cpu]
+            prev_comp_ids   = [t.to(policy_device) for t in prev_comp_ids_cpu]
+            policy_lps_flat = batched_sequence_logprobs(
+                model, prev_prompt_ids, prev_comp_ids, pad_id
+            )
+
+            _, ref_lps_cpu, rewards_list = result_q.get()
+
+            rewards = torch.tensor(
+                rewards_list, dtype=torch.float32, device=policy_device
+            ).view(B_prev, prev_N)
+
+            if not all(rewards[b].std() < 1e-6 for b in range(B_prev)):
+                policy_lps_t = torch.stack(policy_lps_flat).view(B_prev, prev_N)
+                ref_lps_t = torch.stack(
+                    [lp.to(policy_device) for lp in ref_lps_cpu]
+                ).view(B_prev, prev_N).detach()
+
+                losses = [
+                    grpo_loss(policy_lps_t[b], ref_lps_t[b], rewards[b], beta=args.beta)
+                    for b in range(B_prev) if rewards[b].std() >= 1e-6
+                ]
+
+                if losses:
+                    loss = torch.stack(losses).mean()
+                    (loss / args.grad_accum).backward()
+                    global_step += 1
+
+                    if global_step % args.grad_accum == 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                        optimizer.step()
+                        optimizer.zero_grad()
+
+        ckpt = out_dir / f"epoch_{epoch+1}"
+        model.save_pretrained(ckpt)
+        tokenizer.save_pretrained(ckpt)
+        print(f"Epoch {epoch+1} complete → {ckpt}")
+
+    # Shut down worker thread
+    gen_q.put(None)
+    worker.join()
 
     final = out_dir / "final"
     model.save_pretrained(final)

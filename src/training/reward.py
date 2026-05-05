@@ -28,20 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from src.eval.parser import parse_completion
-
-# ── Judge prompts ─────────────────────────────────────────────────────────────
-
-_CLADDER_JUDGE_SYSTEM = (
-    "You are an expert in causal inference. "
-    "Score whether a predicted estimand expression is semantically equivalent to the reference. "
-    "Reply with a single integer only: 0 (wrong or missing), 1 (partially correct), 2 (correct)."
-)
-
-_CAUSCI_JUDGE_SYSTEM = (
-    "You are an expert in causal inference. "
-    "Score whether the estimation specification is appropriate for the given method and identified variables. "
-    "Reply with a single integer only: 0 (inappropriate), 1 (partially appropriate), 2 (appropriate)."
-)
+from src.eval.metrics import CLADDER_JUDGE_SYSTEM, CAUSCI_JUDGE_SYSTEM
 
 
 def _format_judge_prompts(system: str, user_messages: list[str], tokenizer) -> list[str]:
@@ -101,7 +88,7 @@ def _judge_cladder_step3(
         f"Reference: {ref}\nPredicted: {pred}\nScore:"
         for pred, ref in zip(predicted_list, reference_list)
     ]
-    prompts = _format_judge_prompts(_CLADDER_JUDGE_SYSTEM, user_msgs, judge_tokenizer)
+    prompts = _format_judge_prompts(CLADDER_JUDGE_SYSTEM, user_msgs, judge_tokenizer)
     return _run_judge_batch(prompts, judge_model, judge_tokenizer)
 
 
@@ -116,17 +103,11 @@ def _judge_causci_step3(
         f"Method: {method}\nVariables identified: {step1}\nSpecification: {spec}\nScore:"
         for spec, method, step1 in zip(spec_list, method_list, step1_list)
     ]
-    prompts = _format_judge_prompts(_CAUSCI_JUDGE_SYSTEM, user_msgs, judge_tokenizer)
+    prompts = _format_judge_prompts(CAUSCI_JUDGE_SYSTEM, user_msgs, judge_tokenizer)
     return _run_judge_batch(prompts, judge_model, judge_tokenizer)
 
 
 # ── CLadder ───────────────────────────────────────────────────────────────────
-
-CLADDER_QUERY_TYPES = {
-    "marginal", "correlation", "ate", "backadj", "det-counterfactual",
-    "ett", "nde", "nie", "collider_bias", "exp_away",
-}
-
 
 def _score_cladder(parsed: dict, gt: dict, step3_judge: int) -> float:
     total = 0.0
@@ -153,11 +134,6 @@ def _score_cladder(parsed: dict, gt: dict, step3_judge: int) -> float:
 
 
 # ── CauSciBench ───────────────────────────────────────────────────────────────
-
-CAUSCI_METHODS = {
-    "diff_in_means", "ols", "ipw", "matching", "did", "rdd", "iv", "frontdoor", "glm",
-}
-
 
 def _step1_score(parsed_step1: str, gt_step1: dict) -> float:
     text = parsed_step1.lower()

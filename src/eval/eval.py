@@ -21,25 +21,27 @@ sys.path.insert(0, str(ROOT))
 
 from src.eval.metrics import aggregate_metrics, score_causcibench, score_cladder
 from src.eval.parser import parse_completion
+from src.config import (
+    POLICY_MODEL as DEFAULT_MODEL,
+    JUDGE_MODEL,
+    EVAL_BATCH_SIZE as BATCH_SIZE,
+    EVAL_MAX_TOKENS,
+)
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = "Qwen/Qwen3-14B"
-JUDGE_MODEL   = "deepseek-ai/deepseek-math-7b-instruct"
-TEST_DATA     = ROOT / "output" / "test.jsonl"
-OUTPUT_DIR    = ROOT / "output" / "eval"
+TEST_DATA  = ROOT / "output" / "test.jsonl"
+OUTPUT_DIR = ROOT / "output" / "eval"
 
 GENERATION_KWARGS = dict(
-    max_new_tokens=4096,
+    max_new_tokens=EVAL_MAX_TOKENS,
     do_sample=False,
     temperature=1.0,
     repetition_penalty=1.1,
 )
-
-BATCH_SIZE = 4
 
 JUDGE_QUANT_CONFIG = BitsAndBytesConfig(
     load_in_4bit=True,
