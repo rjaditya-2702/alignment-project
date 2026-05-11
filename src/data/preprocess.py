@@ -35,14 +35,15 @@ CLADDER_PROMPT = """You are given a scenario describing relationships between va
 ---
 
 Strict rules (follow these exactly):
-- Output ONLY the five numbered steps in order.
 - Nothing before "## Step 1" and nothing after the single word in Step 5.
 - Write each step exactly once.
 - Each step must be short and direct. No long paragraphs or verbosity.
 - Do not repeat content from previous steps.
-- Step 5 must contain exactly one word on its own line: "Yes" or "No". No quotes, no extra text, no code, no periods.
+- Output Steps 1–4 inside the thinking block only.
+- After Step 4, close the thinking block.
+- After </think>, output exactly one word: "Yes" or "No". No quotes, no punctuation, no extra text.
+- Stop immediately after that word.
 - Do not repeat any step, any code block, or the word "Yes".
-- Stop immediately after Step 5. Do not continue generating. No extra sentences, no "Okay let's see", no repetition.
 
 ### Query Type Definitions
 
@@ -90,8 +91,10 @@ Strict rules (follow these exactly):
 
 ---
 
-Now solve the problem.
+Now solve the problem in the following way:
 
+```
+<think>
 ## Step 1: Causal Structure
 Assign algebraic variables (e.g., X, Y, Z) to each entity mentioned in the scenario. Identify all directed causal edges.
 For example: V1 -> V2, V2 -> V3
@@ -110,8 +113,9 @@ Show your derivation.
 
 ## Step 4: Compute
 Using the estimand from Step 3 and the numerical values given in the Data section, compute the result step by step. Show the arithmetic explicitly — substitute each probability value and simplify to a final number.
+</think>
+```
 
-## Step 5: Answer
 Based on the computed result and what the question is asking, answer Yes or No. One word only.
 - For ate/ett/nde/nie: positive result → Yes if question asks "does X increase Y", No if "decrease". Flip if question asks the opposite.
 - For marginal: P(Y) > 0.5 and question asks "is Y more likely than not" → Yes.
@@ -119,12 +123,12 @@ Based on the computed result and what the question is asking, answer Yes or No. 
 - For backadj/collider_bias/exp_away: Yes or No based on graph analysis.
 - For det-counterfactual: Yes or No based on computed probability.
 
-IMPORTANT: After writing Step 5 with a single word, STOP. No more text is allowed.
+IMPORTANT: After writing answer with a single word, STOP. No more text is allowed.
 
 ## Scenario
 {verbalized_story}
 
-Respond now with exactly the five steps. Begin directly with ## Step 1.
+Respond now. Begin directly with <think>
 """
 
 CAUSCI_PROMPT = """You are given a dataset from a research study along with a description of how the data was collected. Your task is to estimate the effect of one variable on another by following these steps precisely.
@@ -383,7 +387,7 @@ def process_cladder_row(row, split):
 
     out = {
         "id":         row["id"],
-        "source":     SOURCE_MAP[row["source"]],
+        "source":     'cladder',
         "split":      split,
         "prompt":     prompt,
         "label":      label,
@@ -443,7 +447,7 @@ def process_causcibench_row(row, split, csv_failures):
 
     return {
         "id":         row["id"],
-        "source":     SOURCE_MAP[row["source"]],
+        "source":     'causcibench',
         "split":      split,
         "prompt":     prompt,
         "label":      label,

@@ -33,6 +33,8 @@ import sys
 import threading
 from pathlib import Path
 
+from tqdm import tqdm
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
@@ -129,8 +131,9 @@ def load_policy(model_name: str, device: str = None):
     base = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
+        device_map={"": device},
         trust_remote_code=True,
-    ).to(device)
+    )
 
     if len(tokenizer) > base.config.vocab_size:
         base.resize_token_embeddings(len(tokenizer))
@@ -166,7 +169,7 @@ def load_judge(model_name: str, device: str = None):
     print(f"Loading judge model from {model_name} (4-bit, device={device_map})")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        quantization_config=JUDGE_QUANT_CONFIG,
+        quantization_config=None, #JUDGE_QUANT_CONFIG,
         device_map=device_map,
         trust_remote_code=True,
     )
@@ -400,7 +403,13 @@ def _train_single_gpu(all_rows, out_dir, resume_ckpt, start_step):
         accum_loss = accum_reward = 0.0
         n_accum = 0
 
-        for batch_start in range(0, len(all_rows), BATCH_SIZE):
+        pbar = tqdm(
+            range(0, len(all_rows), BATCH_SIZE),
+            desc=f"Epoch {epoch+1}/{MAX_EPOCHS}",
+            dynamic_ncols=True,
+        )
+
+        for batch_start in pbar:
             batch = all_rows[batch_start : batch_start + BATCH_SIZE]
             B     = len(batch)
             N     = N_ROLLOUTS
@@ -459,11 +468,10 @@ def _train_single_gpu(all_rows, out_dir, resume_ckpt, start_step):
                 optimizer.zero_grad()
 
             if global_step % LOG_EVERY == 0 and n_accum > 0:
-                print(
-                    f"epoch={epoch+1}  step={global_step:>6}  "
-                    f"loss={accum_loss/n_accum:.4f}  "
-                    f"reward={accum_reward/n_accum:.3f}",
-                    flush=True,
+                pbar.set_postfix(
+                    step=global_step,
+                    loss=f"{accum_loss/n_accum:.4f}",
+                    reward=f"{accum_reward/n_accum:.3f}",
                 )
                 accum_loss = accum_reward = 0.0
                 n_accum = 0
@@ -472,12 +480,12 @@ def _train_single_gpu(all_rows, out_dir, resume_ckpt, start_step):
                 ckpt = out_dir / f"step_{global_step}"
                 model.save_pretrained(ckpt)
                 tokenizer.save_pretrained(ckpt)
-                print(f"Saved → {ckpt}")
+                tqdm.write(f"Saved → {ckpt}")
 
+        tqdm.write(f"Epoch {epoch+1} complete → {out_dir / f'epoch_{epoch+1}'}")
         ckpt = out_dir / f"epoch_{epoch+1}"
         model.save_pretrained(ckpt)
         tokenizer.save_pretrained(ckpt)
-        print(f"Epoch {epoch+1} complete → {ckpt}")
 
     final = out_dir / "final"
     model.save_pretrained(final)
@@ -545,7 +553,14 @@ def _train_multi_gpu(all_rows, out_dir, resume_ckpt, start_step):
         prev_comp_ids_cpu   = None
         prev_N              = None
 
-        for i, batch in enumerate(batches):
+        pbar = tqdm(
+            enumerate(batches),
+            total=len(batches),
+            desc=f"Epoch {epoch+1}/{MAX_EPOCHS}",
+            dynamic_ncols=True,
+        )
+
+        for i, batch in pbar:
             N = N_ROLLOUTS
 
             # ── Overlap A: generate batch_i on GPU 0 ─────────────────────
@@ -608,11 +623,10 @@ def _train_multi_gpu(all_rows, out_dir, resume_ckpt, start_step):
                             optimizer.zero_grad()
 
                         if global_step % LOG_EVERY == 0 and n_accum > 0:
-                            print(
-                                f"epoch={epoch+1}  step={global_step:>6}  "
-                                f"loss={accum_loss/n_accum:.4f}  "
-                                f"reward={accum_reward/n_accum:.3f}",
-                                flush=True,
+                            pbar.set_postfix(
+                                step=global_step,
+                                loss=f"{accum_loss/n_accum:.4f}",
+                                reward=f"{accum_reward/n_accum:.3f}",
                             )
                             accum_loss = accum_reward = 0.0
                             n_accum = 0
@@ -621,7 +635,7 @@ def _train_multi_gpu(all_rows, out_dir, resume_ckpt, start_step):
                             ckpt = out_dir / f"step_{global_step}"
                             model.save_pretrained(ckpt)
                             tokenizer.save_pretrained(ckpt)
-                            print(f"Saved → {ckpt}")
+                            tqdm.write(f"Saved → {ckpt}")
 
             # Roll over: current batch becomes previous for next iteration
             prev_batch          = batch
@@ -666,10 +680,10 @@ def _train_multi_gpu(all_rows, out_dir, resume_ckpt, start_step):
                         optimizer.step()
                         optimizer.zero_grad()
 
+        tqdm.write(f"Epoch {epoch+1} complete → {out_dir / f'epoch_{epoch+1}'}")
         ckpt = out_dir / f"epoch_{epoch+1}"
         model.save_pretrained(ckpt)
         tokenizer.save_pretrained(ckpt)
-        print(f"Epoch {epoch+1} complete → {ckpt}")
 
     # Shut down worker thread
     gen_q.put(None)
