@@ -12,18 +12,23 @@ JUDGE_MODEL  = "deepseek-ai/deepseek-math-7b-instruct"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-TRAIN_DATA     = ROOT / "src" / "output" / "train.jsonl"
-TEST_DATA      = ROOT / "src" / "output" / "test.jsonl"
-
+TRAIN_DATA_RL     = ROOT / "src" / "output_RL" / "train.jsonl"
+TEST_DATA_RL      = ROOT / "src" / "output_RL" / "test.jsonl"
+OUTPUT_DIR_RL   = ROOT / "src" / "output_RL"
 CHECKPOINT_DIR = ROOT / "src" / "output_RL" / "checkpoints"
-EVAL_MODEL     = ROOT / "src" / "output_RL" / "checkpoints" / "final"  # eval loads from here
-EVAL_OUTPUT    = ROOT / "src" / "output_RL" / "eval"
+FINAL_MODEL     = ROOT / "src" / "output_RL" / "checkpoints" / "final"  # eval loads from here
 PLOT_DIR       = ROOT / "src" / "output_RL" / "plots"
 
+TRAIN_DATA_SFT_LORA     = ROOT / "src" / "output_fine_tune_lora" / "train.jsonl"
+TEST_DATA_SFT_LORA      = ROOT / "src" / "output_fine_tune_lora" / "test.jsonl"
+OUTPUT_DIR_SFT_LORA = ROOT / "src" / "output_fine_tune_lora"
 SFT_LORA_OUTPUT_DIR = ROOT / "src" / "output_fine_tune_lora"
 SFT_LORA_PLOT_DIR   = ROOT / "src" / "output_fine_tune_lora" / "plots"
 SFT_LORA_CHECKPOINT_DIR = ROOT / "src" / "output_fine_tune_lora" / "checkpoints"
 
+TRAIN_DATA_SFT     = ROOT / "src" / "output_fine_tune" / "train.jsonl"
+TEST_DATA_SFT      = ROOT / "src" / "output_fine_tune" / "test.jsonl"
+OUTPUT_DIR_SFT   = ROOT / "src" / "output_fine_tune"
 SFT_OUTPUT_DIR = ROOT / "src" / "output_fine_tune"
 SFT_PLOT_DIR   = ROOT / "src" / "output_fine_tune" / "plots"
 SFT_CHECKPOINT_DIR = ROOT / "src" / "output_fine_tune" / "checkpoints"

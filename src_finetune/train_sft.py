@@ -70,30 +70,262 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from tqdm import tqdm
 
+from src.data.preprocess import preprocess
+from src.config import (TRAIN_DATA_SFT_LORA as TRAIN_DATA,
+                        TEST_DATA_SFT_LORA  as TEST_DATA,
+                        SFT_LORA_OUTPUT_DIR,
+                        SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR, ROOT,
+                        
+                        POLICY_MODEL,
+                        TRAIN_BATCH_SIZE,
+                        MAX_PROMPT_LEN,
+                        TRAIN_MAX_TOKENS,
+                        LR,
+                        WEIGHT_DECAY,
+                        GRAD_ACCUM,
+                        MAX_GRAD_NORM,
+                        SAVE_EVERY,
+                        LOG_EVERY,
+                        LORA_R,
+                        MAX_EPOCHS)
+
+
+CLADDER_PROMPT = """You are given a scenario describing relationships between variables, along with numerical data and a question. Your task is to determine the answer by following these steps precisely.
+---
+
+Strict rules (follow these exactly):
+- Nothing before "## Step 1" and nothing after the single word in Step 5.
+- Write each step exactly once.
+- Each step must be short and direct. No long paragraphs or verbosity.
+- Do not repeat content from previous steps.
+- Output Steps 1–4 inside the thinking block only.
+- After Step 4, close the thinking block.
+- After </think>, output exactly one word: "Yes" or "No". No quotes, no punctuation, no extra text.
+- Stop immediately after that word.
+- Do not repeat any step, any code block, or the word "Yes".
+
+### Query Type Definitions
+
+1. **marginal** — What is the overall probability of a variable?
+   Formula: P(Y = y)
+   Use when: The question asks about the baseline likelihood of an outcome across the whole population, with no conditions or interventions.
+
+2. **correlation** — Does observing one variable change the probability of another?
+   Formula: P(Y = y | X = x)
+   Use when: The question asks whether knowing or observing one variable's value changes the likelihood of another. No intervention — just observation.
+
+3. **ate** — What is the effect of actively changing (intervening on) a variable?
+   Formula: E[Y | do(X=1)] - E[Y | do(X=0)]
+   Use when: The question asks whether forcing or setting a variable to a value increases or decreases an outcome. The key word is "intervention" or "effect of doing X."
+   Key technique: Use backdoor adjustment if confounders exist: Σ_z P(Z=z)[P(Y=1|X=1,Z=z) - P(Y=1|X=0,Z=z)]. Use frontdoor adjustment if treatment is confounded but a mediator satisfies the frontdoor criterion.
+
+4. **backadj** — Should we adjust for a set of variables when estimating an effect?
+   Formula: Check if the set S blocks all backdoor paths between treatment X and outcome Y in the graph.
+   Use when: The question asks whether to look at the overall correlation between X and Y, or to look at it stratified by (adjusted for) other variables.
+   Answer is yes if S is a valid adjustment set (blocks all non-causal paths), no otherwise.
+
+5. **det-counterfactual** — What would have happened under a different condition?
+   Formula: P(Y_x = y | evidence)
+   Use when: The question asks what the outcome would have been if the treatment had been different, given specific observed facts. Uses the three-step procedure: (1) Abduction — update P(U) given evidence, (2) Action — set X = x in the structural equations, (3) Prediction — compute P(Y = y) in the modified model.
+
+6. **ett** — For those who received treatment, what would have happened without it?
+   Formula: E[Y₁ - Y₀ | X = 1]
+   Use when: The question focuses specifically on the treated subgroup and asks how their outcome would change in the absence of treatment. Also called Average Treatment Effect on the Treated (ATT).
+
+7. **nde** — What is the direct effect, not through any mediator?
+   Formula: E[Y_{1,M₀} - Y_{0,M₀}]
+   Use when: The question asks about the effect of X on Y while holding the mediator at its natural value under no treatment. Also called Natural Direct Effect.
+
+8. **nie** — What is the indirect effect, only through the mediator?
+   Formula: E[Y_{0,M₁} - Y_{0,M₀}]
+   Use when: The question asks about the effect of X on Y that operates only through an intermediate variable (mediator), not directly. Also called Natural Indirect Effect.
+
+9. **collider_bias** — Does intervening on one cause of a common effect create a spurious association with another cause?
+   Formula: Check whether do(X) changes Y when X and Y share only a common effect (collider), not a common cause.
+   Use when: The question involves a variable that is caused by both X and Y (a collider), and asks whether intervening on X affects Y. The answer is always no if X and Y have no common causes — the apparent association through the collider is spurious.
+
+10. **exp_away** — Does conditioning on a common effect change the association between its causes?
+    Formula: Compare P(Y | X) versus P(Y | X, Z) where Z is a collider.
+    Use when: The question asks whether holding fixed (conditioning on) a common effect of X and Y changes how X and Y are associated. This is the "explaining away" phenomenon — conditioning on a collider can create a spurious association between its parents.
+
+---
+
+Now solve the problem in the following way:
+
+```
+<think>
+## Step 1: Causal Structure
+Assign algebraic variables (e.g., X, Y, Z) to each entity mentioned in the scenario. Identify all directed causal edges.
+For example: V1 -> V2, V2 -> V3
+
+## Step 2: Query Classification
+Based on the question and the definitions above, classify this query. Return exactly one of:
+marginal, correlation, ate, backadj, det-counterfactual, ett, nde, nie, collider_bias, exp_away
+
+## Step 3: Derive Estimand
+Using the causal graph from Step 1 and the query type from Step 2, write the mathematical expression that answers the question.
+- If the query involves do(), apply do-calculus rules (backdoor adjustment, frontdoor adjustment) to eliminate do() terms and express everything in terms of observable probabilities.
+- If the query is counterfactual, apply the three-step abduction-action-prediction procedure.
+- If the query is about adjustment sets or collider bias, reason about the graph structure (paths, d-separation).
+
+Show your derivation.
+
+## Step 4: Compute
+Using the estimand from Step 3 and the numerical values given in the Data section, compute the result step by step. Show the arithmetic explicitly — substitute each probability value and simplify to a final number.
+</think>
+```
+
+Based on the computed result and what the question is asking, answer Yes or No. One word only.
+- For ate/ett/nde/nie: positive result → Yes if question asks "does X increase Y", No if "decrease". Flip if question asks the opposite.
+- For marginal: P(Y) > 0.5 and question asks "is Y more likely than not" → Yes.
+- For correlation: P(Y|X=1) > P(Y|X=0) and question asks "does observing X increase Y" → Yes.
+- For backadj/collider_bias/exp_away: Yes or No based on graph analysis.
+- For det-counterfactual: Yes or No based on computed probability.
+
+IMPORTANT: After writing answer with a single word, STOP. No more text is allowed.
+
+## Scenario
+{verbalized_story}
+
+Respond now. Begin directly with <think>
+"""
+
+CAUSCI_PROMPT = """You are given a dataset from a research study along with a description of how the data was collected. Your task is to estimate the effect of one variable on another by following these steps precisely.
+
+## Study Description
+{dataset_description}
+
+## Dataset
+Path: {file_path}
+Shape: {shape}
+
+Columns and types:
+{columns_and_types}
+
+First 5 rows:
+{df_head}
+
+Summary statistics:
+{df_describe}
+
+Missing values per column:
+{missing_values}
+
+Low-cardinality columns (≤10 unique values):
+{low_cardinality}
+
+## Question
+{query}
+
+---
+
+Use the following reference to guide your reasoning.
+
+### Method Definitions
+
+1. **diff_in_means (Difference in Means)**
+   When to use: The data comes from a randomized experiment where units were randomly assigned to treatment or control, and compliance was enforced. Random assignment ensures both groups are comparable on average.
+   Estimand: ATE (Average Treatment Effect)
+   Formula: τ = (1/n₁)Σ Yᵢ(treated) - (1/n₀)Σ Yᵢ(control)
+   Equivalent regression: Y = α + τT + ε. The coefficient on T is the treatment effect.
+   If pre-treatment covariates are available, include them to improve precision: Y = α + τT + Xβ + ε. The coefficient on T remains the causal effect.
+
+2. **ols (Ordinary Least Squares with Controls)**
+   When to use: Observational data where all confounders (variables affecting both treatment and outcome) are observed and included as controls. No unobserved confounding.
+   Estimand: ATE
+   Formula: Y = α + τT + Xβ + ε, where X includes all confounders. The coefficient τ on T is the causal effect.
+   Key assumption: Conditional ignorability — Y(0),Y(1) ⊥ T | X. After controlling for X, treatment assignment is as good as random.
+   Warning: If there are unobserved confounders, OLS is biased. Consider IV or other methods.
+
+3. **ipw (Inverse Probability Weighting)**
+   When to use: Observational data where treatment is not random but confounders are observed. Particularly useful when the treatment model (propensity score) is well-specified.
+   Estimand: ATE, ATT, or ATC depending on the question.
+   Formula for ATE: τ_ATE = [Σ Yᵢ·Tᵢ/e(Xᵢ)] / [Σ Tᵢ/e(Xᵢ)] - [Σ Yᵢ·(1-Tᵢ)/(1-e(Xᵢ))] / [Σ (1-Tᵢ)/(1-e(Xᵢ))]
+   where e(X) is the propensity score, estimated via logistic regression of T on X.
+   Key assumption: Conditional ignorability (same as OLS) plus overlap — every unit must have nonzero probability of receiving either treatment level: 0 < e(X) < 1.
+   Warning: Unstable when propensity scores are near 0 or 1. Consider matching instead.
+
+4. **matching (Propensity Score Matching)**
+   When to use: Observational data with observed confounders. Preferred over IPW when propensity score overlap is poor. Think of it as a preprocessing step that makes treatment and control groups more comparable.
+   Estimand: ATE or ATT.
+   Procedure: For each treated unit, find the nearest control unit(s) based on covariates or propensity score. Compute effect as average difference in outcomes between matched pairs.
+   Formula for ATT: τ_ATT = (1/n₁) Σᵢ∈treated (Yᵢ - (1/K) Σₖ Y_matched_k)
+   Key assumption: Conditional ignorability plus overlap, same as IPW.
+
+5. **did (Difference-in-Differences)**
+   When to use: Panel data (observations over multiple time periods) where a treatment was introduced to one group at a specific time. There must be a clear pre-period and post-period, and a treatment group versus control group.
+   Estimand: ATT (Average Treatment Effect on the Treated)
+   Formula (canonical 2×2): Y = α + β·POST + γ·TREAT + δ·(POST × TREAT) + Xβ + ε. The coefficient δ is the DiD estimator.
+   Formula (TWFE, staggered treatment): Y_it = αᵢ + λₜ + δ·D_it + X_it·β + ε_it. The coefficient δ is the effect. αᵢ are unit fixed effects, λₜ are time fixed effects.
+   Key assumptions: Parallel trends — in the absence of treatment, treated and control groups would have followed the same trajectory. No anticipatory effects.
+   How to identify: Look for a time variable that indicates treatment timing (not just a covariate), and group indicators for who received treatment.
+
+6. **rdd (Regression Discontinuity Design)**
+   When to use: Treatment is assigned based on whether a continuous variable (the running variable) crosses a threshold/cutoff. Units just above and below the cutoff are comparable.
+   Estimand: Local ATE (at the cutoff)
+   Formula: τ_RDD = lim(r→r₀⁺) E[Y|R=r] - lim(r→r₀⁻) E[Y|R=r]
+   Key assumption: Potential outcomes are continuous at the cutoff. The only thing that changes discontinuously at the threshold is treatment status.
+   How to identify: Look for a continuous variable where a threshold determines eligibility or assignment. Examples: test scores determining program eligibility, age cutoffs, income thresholds.
+
+7. **iv (Instrumental Variables / Two-Stage Least Squares)**
+   When to use: Unobserved confounders exist between treatment and outcome, but an instrument is available. The instrument must affect the outcome only through the treatment.
+   Estimand: LATE (Local Average Treatment Effect) or CACE (Complier Average Causal Effect)
+   Procedure: Stage 1 — regress treatment T on instrument Z (and controls X): T = π₀ + π₁Z + Xγ + ν. Stage 2 — regress outcome Y on predicted treatment T̂ (and controls X): Y = β₀ + τT̂ + Xδ + ε. The coefficient τ is the causal effect.
+   Key assumptions: (1) Relevance — Z is correlated with T (testable: first-stage F-statistic > 10). (2) Exclusion restriction — Z affects Y only through T (untestable, requires domain justification). (3) Independence — Z is independent of unobserved confounders. (4) Monotonicity — Z moves T in the same direction for everyone.
+   How to identify: Look for a variable that plausibly affects treatment uptake but has no direct effect on the outcome. Common examples: geographic proximity as instrument for schooling, lottery assignments as instruments for program participation.
+
+8. **frontdoor (Frontdoor Adjustment)**
+   When to use: Unobserved confounders exist between treatment and outcome, but a mediator M exists such that (1) T → M → Y captures the full causal path, (2) there are no unobserved confounders between T and M, and (3) there are no unobserved confounders between M and Y after controlling for T.
+   Estimand: ATE
+   Formula: P(Y|do(T)) = Σ_m P(M=m|T) · Σ_t P(Y|M=m, T=t) · P(T=t)
+   How to identify: Look for a mediator that fully transmits the treatment's effect. Rare in practice. The data description may mention an intermediate step or mechanism.
+
+9. **glm (Generalized Linear Model)**
+   When to use: The outcome is non-linear — binary (logistic regression), count data (Poisson regression), bounded/proportional (beta regression). Confounders are observed.
+   Estimand: Conditional effect (log-odds ratio, incidence rate ratio, etc., depending on the link function)
+   Formula: g(E[Y]) = α + τT + Xβ, where g() is the link function (logit for binary, log for counts).
+   The coefficient τ represents the effect of treatment on the transformed outcome scale.
+   How to identify: Check the outcome variable. If it's binary (0/1), use logistic regression. If it's a count (0, 1, 2, ...), consider Poisson. If it's continuous and unbounded, OLS is likely more appropriate.
+
+---
+
+Respond with the five numbered steps below in order. Do not write any introduction, explanation, or preamble before Step 1. Write each step exactly once. Stop after Step 5.
+
+## Step 1: Causal Structure
+Using the study description and dataset columns, identify:
+- treatment: <column_name>
+- outcome: <column_name>
+- controls: [<col1>, <col2>, ...]
+- instrument: <column_name> or none
+- running_variable: <column_name> or none
+- time_variable: <column_name> or none
+- group_variable: <column_name> or none
+
+## Step 2: Method Selection
+Based on the study description, data collection process, and the method definitions above, select the most appropriate method. Return exactly one of:
+diff_in_means, ols, ipw, matching, did, rdd, iv, frontdoor, glm
+
+Justify in one sentence based on the study design and the assumptions that can be invoked.
+
+## Step 3: Estimation Specification
+Write the formal estimation setup:
+- The regression formula or procedure
+- The estimand (ATE, ATT, LATE, etc.)
+- The key identification assumption being invoked
+
+## Step 4: Compute
+Using the estimation specification from Step 3 and the data summary above (column types, summary statistics, sample rows), compute the effect estimate numerically. Show the arithmetic step by step — substitute values and simplify to a final number.
+
+## Step 5: Answer
+Report the estimated effect as a single number.
+"""
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT                    = Path(__file__).resolve().parents[1]
-TRAIN_DATA     = ROOT / "src" / "output" / "train.jsonl"
-TEST_DATA      = ROOT / "src" / "output" / "test.jsonl"
-SFT_LORA_OUTPUT_DIR     = ROOT / "src" / "output_fine_tune_lora"
-SFT_LORA_PLOT_DIR       = SFT_LORA_OUTPUT_DIR / "plots"
-SFT_LORA_CHECKPOINT_DIR = SFT_LORA_OUTPUT_DIR / "checkpoints"
 
 for d in [SFT_LORA_OUTPUT_DIR, SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-POLICY_MODEL       = "Qwen/Qwen3-8B"
-TRAIN_BATCH_SIZE   = 4
-MAX_PROMPT_LEN     = 4096
-TRAIN_MAX_TOKENS   = 1200
-LR                 = 2e-5
-WEIGHT_DECAY       = 0.01
-GRAD_ACCUM         = 1
-MAX_GRAD_NORM      = 1.0
-MAX_EPOCHS         = 3
-SAVE_EVERY         = 500
-LOG_EVERY          = 10
 LORA_R             = 32
 LORA_ALPHA         = 64
 LORA_DROPOUT       = 0.05
@@ -424,4 +656,5 @@ def train():
 
 
 if __name__ == "__main__":
+    preprocess(cladder_prompt = CLADDER_PROMPT, causci_prompt = CAUSCI_PROMPT, output_dir = SFT_LORA_OUTPUT_DIR)
     train()

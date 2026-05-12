@@ -11,27 +11,49 @@ For each problem the model must produce 5 steps: (1) identify causal structure, 
 
 ---
 
-## High-level design
+## Training methods
 
-**Algorithm: GRPO (Group Relative Policy Optimization)**
+Two training approaches are implemented, each with its own prompt format and output directory.
 
-For each training prompt, generate N rollouts, score each with a reward function, normalize rewards within the group to advantages, and minimize the KL-penalized policy gradient loss:
+### RL-based (GRPO)
 
-```
-loss = -mean(advantage * log_prob_policy) + β * KL(policy || reference)
-```
+**Script:** `src/training/train.py`
 
-**Policy:** Qwen3-14B with LoRA adapters (r=32, all attention + MLP projections). Reference logprobs come from the same base weights with adapters temporarily disabled — no second model copy needed.
+Uses TRL's `GRPOTrainer` with vLLM for rollout generation. For each prompt, N completions are sampled, scored by a reward function, and the policy is updated via Group Relative Policy Optimization with a KL penalty against the base model.
 
-**Judge:** DeepSeek-Math-7B-Instruct at 4-bit, frozen. Used to score step 3 (estimand / estimation spec) where exact matching is impossible. All other steps use heuristics.
+The prompt asks the model to reason inside a `<think>` block and return a structured JSON object with all 5 steps.
 
-**Reward design:**
-- CLadder: cascading −100 penalty per failed step (wrong query type → step 3 also penalized)
-- CauSciBench: independent −50 per failed step; numeric answer scored by relative error tiers (≤10% → 30 pts, ≤25% → 20, ≤50% → 10, else −50)
+Output: `src/output_RL/`
 
-**Dataset:** 102,050 synthetic training examples (101,600 CLadder via `causalbenchmark`, 450 CauSciBench via `causci_bench` + GPT context). Test set: 10,426 original benchmark examples held out entirely.
+### SFT-based (LoRA fine-tuning)
 
-**Multi-GPU:** On 2 GPUs, generation (GPU 0) and reference logprob + reward computation (GPU 1) are pipelined to overlap.
+**Scripts:** `src_finetune/train_sft.py` (single GPU), `src_finetune/train_sft_ddp.py` (multi-GPU DDP)
+
+QLoRA fine-tuning with a custom loss:
+- CE over thinking tokens (steps 1–4 inside `<think>`)
+- λ × CE over the answer token (Yes/No) immediately after `</think>`
+
+The prompt asks the model to reason inside a `<think>` block and output a single word answer.
+
+Output: `src/output_fine_tune_lora/`
+
+### Prompt differences
+
+The two training methods use different prompt templates defined in their respective training scripts. Both are passed to `preprocess()` at startup, which rebuilds the dataset with the correct template for that run.
+
+---
+
+## Policy model
+
+`Qwen/Qwen3-8B` with QLoRA adapters (r=32, all attention + MLP projections).
+
+Judge for reward scoring: `deepseek-ai/deepseek-math-7b-instruct` (RL only).
+
+---
+
+## Dataset
+
+102,050 synthetic training examples (CLadder + CauSciBench). Test set: original benchmark examples held out entirely.
 
 ---
 
@@ -39,67 +61,75 @@ loss = -mean(advantage * log_prob_policy) + β * KL(policy || reference)
 
 ```
 src/
-  config.py               — single source of truth: model names, paths, all hyperparameters
+  config.py                    — single source of truth: model names, paths, all hyperparameters
 
   data/
-    data.py               — load CLadder (HuggingFace) + CauSciBench (local JSON), prompt templates
-    synthetic_cladder.py  — generate synthetic CLadder via causalbenchmark + RandomBuilder
-    synthetic_causci.py   — generate synthetic CauSciBench via causci_bench generators + GPT context
-    build_dataset.py      — orchestrate all 4 sources → dataset/unified.jsonl (checkpointed)
-    split_dataset.py      — split unified.jsonl → dataset/train.jsonl + dataset/test.jsonl
-    preprocess.py         — rebuild prompts with updated templates, normalize labels → output/
+    preprocess.py              — rebuild prompts with caller-supplied templates, normalize labels
+                                 called at the start of each training script with that script's prompts
 
   eval/
-    parser.py             — extract per-step fields from completions via regex
-    metrics.py            — per-step scoring + DeepSeek-Math judge + aggregate metrics
-    eval.py               — entry point: load model → generate → parse → score → write results
+    parser.py                  — extract per-step fields from completions via regex
+    metrics.py                 — per-step scoring + judge calls + aggregate metrics
+    eval.py                    — entry point: load model → generate → parse → score → write results
 
   training/
-    reward.py             — reward functions (heuristics + batched judge calls)
-    train.py              — GRPO loop: LoRA policy, gradient checkpointing, single/multi-GPU
+    train.py                   — GRPO training loop (TRL + vLLM)
+
+  output_RL/                   — written by train.py
+    train.jsonl / test.jsonl   — preprocessed data (RL prompt format)
+    checkpoints/               — step_N/, epoch_N/, final/
+    plots/
+
+src_finetune/
+  train_sft.py                 — SFT QLoRA, single GPU
+  train_sft_ddp.py             — SFT QLoRA, multi-GPU DDP
+
+  output_fine_tune_lora/       — written by train_sft*.py
+    train.jsonl / test.jsonl   — preprocessed data (SFT prompt format)
+    checkpoints/
+    plots/
 
 dataset/
-  unified.jsonl           — 112,476 combined examples
-  train.jsonl             — 102,050 synthetic
-  test.jsonl              — 10,426 original benchmarks
-
-output/
-  train.jsonl             — preprocessed train (rebuilt prompts, normalized labels)
-  test.jsonl              — preprocessed test
-  checkpoints/            — LoRA checkpoints: step_N/, epoch_N/, final/
-  eval/                   — baseline eval: results.jsonl, metrics.json
-  eval_post_grpo/         — post-training eval
+  train.jsonl                  — raw synthetic training examples
+  test.jsonl                   — raw original benchmark examples
 ```
 
 ---
 
-## How to run training
+## How to run
+
+### RL training (GRPO)
 
 ```bash
 python src/training/train.py
 ```
 
-No arguments. Everything is configured in `src/config.py` — model, hyperparameters, paths.
+Runs preprocessing with the RL prompt, then starts GRPO training. Everything is configured in `src/config.py`.
 
-Auto-resume: on startup, scans `output/checkpoints/` for the latest `step_N/` checkpoint and resumes from there. If none exists, starts fresh from `POLICY_MODEL`. Checkpoints are saved every `SAVE_EVERY` steps and at the end of each epoch. Final weights land in `output/checkpoints/final/`.
+Checkpoints saved every `SAVE_EVERY` steps and at end of each epoch. Final weights: `src/output_RL/checkpoints/final/`.
+
+### SFT training — single GPU
+
+```bash
+python src_finetune/train_sft.py
+```
+
+### SFT training — multi-GPU DDP
+
+```bash
+torchrun --nproc_per_node=NUM_GPUS src_finetune/train_sft_ddp.py
+```
+
+Both SFT scripts run preprocessing with the SFT prompt before training. Final weights: `src/output_fine_tune_lora/final/`.
 
 ---
 
-## How to do eval
+## How to evaluate
 
 ```bash
 python src/eval/eval.py
 ```
 
-Loads the trained model from `output/checkpoints/final` (set via `EVAL_MODEL` in `src/config.py`). Runs greedy generation over `output/test.jsonl`, scores each row, and writes results to `output/eval/`.
+Loads from `src/output_RL/checkpoints/final` (set via `FINAL_MODEL` in `src/config.py`). Runs greedy generation over the test set, scores each row, writes results to `src/output_RL/eval/`.
 
-```bash
-# Smoke test on first N rows
-python src/eval/eval.py --limit 50
-```
-
-Output: `output/eval/results.jsonl` (per-row) and `output/eval/metrics.json` (aggregated). The terminal prints a summary table broken down by query type (CLadder) and method (CauSciBench).
-
-**CLadder scoring (70 pts max):** step 1 structure (11) + step 2 query type (15) + step 3 estimand via judge (24) + step 5 answer (20)
-
-**CauSciBench scoring (60 pts max):** step 1 variables (5) + step 2 method (5) + step 3 spec via judge (15) + step 5 numeric answer (30) + exact within 1% (5)
+Output: `results.jsonl` (per-row) and `metrics.json` (aggregated), plus a summary table broken down by query type (CLadder) and method (CauSciBench).
