@@ -190,7 +190,7 @@ def process_causcibench_row(row, split, csv_failures, causci_prompt):
     if not csv_path.exists():
         print(f"  WARNING: CSV not found for {row['id']}: {csv_path}")
         csv_failures.append(row["id"])
-        return None
+        raise
 
     df = pd.read_csv(csv_path, low_memory=False)
 
@@ -228,6 +228,7 @@ def process_causcibench_row(row, split, csv_failures, causci_prompt):
             "step4": None,
             "step5": label,
         },
+        "csv_path": csv_path
     }
 
 

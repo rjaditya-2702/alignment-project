@@ -2,11 +2,13 @@
 SFT QLoRA Training — Qwen3-8B on CLaDDer
 Loss: CE over thinking tokens + λ * CE over answer token
 """
+import sys
 import os
 import json
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -16,13 +18,17 @@ from tqdm import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
 from src.config import (TRAIN_DATA_SFT_LORA as TRAIN_DATA,
                         TEST_DATA_SFT_LORA  as TEST_DATA,
-                        SFT_LORA_OUTPUT_DIR as OUTPUT_DIR,
-                        SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR,)
+                        SFT_LORA_OUTPUT_DIR,
+                        SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR,
+                        TRAIN_BATCH_SIZE)
 from src.data.preprocess import preprocess
 
 CLADDER_PROMPT = """You are given a scenario describing relationships between variables, along with numerical data and a question. Your task is to determine the answer by following these steps precisely.
@@ -125,143 +131,11 @@ IMPORTANT: After writing answer with a single word, STOP. No more text is allowe
 Respond now. Begin directly with <think>
 """
 
-CAUSCI_PROMPT = """You are given a dataset from a research study along with a description of how the data was collected. Your task is to estimate the effect of one variable on another by following these steps precisely.
-
-## Study Description
-{dataset_description}
-
-## Dataset
-Path: {file_path}
-Shape: {shape}
-
-Columns and types:
-{columns_and_types}
-
-First 5 rows:
-{df_head}
-
-Summary statistics:
-{df_describe}
-
-Missing values per column:
-{missing_values}
-
-Low-cardinality columns (≤10 unique values):
-{low_cardinality}
-
-## Question
-{query}
-
----
-
-Use the following reference to guide your reasoning.
-
-### Method Definitions
-
-1. **diff_in_means (Difference in Means)**
-   When to use: The data comes from a randomized experiment where units were randomly assigned to treatment or control, and compliance was enforced. Random assignment ensures both groups are comparable on average.
-   Estimand: ATE (Average Treatment Effect)
-   Formula: τ = (1/n₁)Σ Yᵢ(treated) - (1/n₀)Σ Yᵢ(control)
-   Equivalent regression: Y = α + τT + ε. The coefficient on T is the treatment effect.
-   If pre-treatment covariates are available, include them to improve precision: Y = α + τT + Xβ + ε. The coefficient on T remains the causal effect.
-
-2. **ols (Ordinary Least Squares with Controls)**
-   When to use: Observational data where all confounders (variables affecting both treatment and outcome) are observed and included as controls. No unobserved confounding.
-   Estimand: ATE
-   Formula: Y = α + τT + Xβ + ε, where X includes all confounders. The coefficient τ on T is the causal effect.
-   Key assumption: Conditional ignorability — Y(0),Y(1) ⊥ T | X. After controlling for X, treatment assignment is as good as random.
-   Warning: If there are unobserved confounders, OLS is biased. Consider IV or other methods.
-
-3. **ipw (Inverse Probability Weighting)**
-   When to use: Observational data where treatment is not random but confounders are observed. Particularly useful when the treatment model (propensity score) is well-specified.
-   Estimand: ATE, ATT, or ATC depending on the question.
-   Formula for ATE: τ_ATE = [Σ Yᵢ·Tᵢ/e(Xᵢ)] / [Σ Tᵢ/e(Xᵢ)] - [Σ Yᵢ·(1-Tᵢ)/(1-e(Xᵢ))] / [Σ (1-Tᵢ)/(1-e(Xᵢ))]
-   where e(X) is the propensity score, estimated via logistic regression of T on X.
-   Key assumption: Conditional ignorability (same as OLS) plus overlap — every unit must have nonzero probability of receiving either treatment level: 0 < e(X) < 1.
-   Warning: Unstable when propensity scores are near 0 or 1. Consider matching instead.
-
-4. **matching (Propensity Score Matching)**
-   When to use: Observational data with observed confounders. Preferred over IPW when propensity score overlap is poor. Think of it as a preprocessing step that makes treatment and control groups more comparable.
-   Estimand: ATE or ATT.
-   Procedure: For each treated unit, find the nearest control unit(s) based on covariates or propensity score. Compute effect as average difference in outcomes between matched pairs.
-   Formula for ATT: τ_ATT = (1/n₁) Σᵢ∈treated (Yᵢ - (1/K) Σₖ Y_matched_k)
-   Key assumption: Conditional ignorability plus overlap, same as IPW.
-
-5. **did (Difference-in-Differences)**
-   When to use: Panel data (observations over multiple time periods) where a treatment was introduced to one group at a specific time. There must be a clear pre-period and post-period, and a treatment group versus control group.
-   Estimand: ATT (Average Treatment Effect on the Treated)
-   Formula (canonical 2×2): Y = α + β·POST + γ·TREAT + δ·(POST × TREAT) + Xβ + ε. The coefficient δ is the DiD estimator.
-   Formula (TWFE, staggered treatment): Y_it = αᵢ + λₜ + δ·D_it + X_it·β + ε_it. The coefficient δ is the effect. αᵢ are unit fixed effects, λₜ are time fixed effects.
-   Key assumptions: Parallel trends — in the absence of treatment, treated and control groups would have followed the same trajectory. No anticipatory effects.
-   How to identify: Look for a time variable that indicates treatment timing (not just a covariate), and group indicators for who received treatment.
-
-6. **rdd (Regression Discontinuity Design)**
-   When to use: Treatment is assigned based on whether a continuous variable (the running variable) crosses a threshold/cutoff. Units just above and below the cutoff are comparable.
-   Estimand: Local ATE (at the cutoff)
-   Formula: τ_RDD = lim(r→r₀⁺) E[Y|R=r] - lim(r→r₀⁻) E[Y|R=r]
-   Key assumption: Potential outcomes are continuous at the cutoff. The only thing that changes discontinuously at the threshold is treatment status.
-   How to identify: Look for a continuous variable where a threshold determines eligibility or assignment. Examples: test scores determining program eligibility, age cutoffs, income thresholds.
-
-7. **iv (Instrumental Variables / Two-Stage Least Squares)**
-   When to use: Unobserved confounders exist between treatment and outcome, but an instrument is available. The instrument must affect the outcome only through the treatment.
-   Estimand: LATE (Local Average Treatment Effect) or CACE (Complier Average Causal Effect)
-   Procedure: Stage 1 — regress treatment T on instrument Z (and controls X): T = π₀ + π₁Z + Xγ + ν. Stage 2 — regress outcome Y on predicted treatment T̂ (and controls X): Y = β₀ + τT̂ + Xδ + ε. The coefficient τ is the causal effect.
-   Key assumptions: (1) Relevance — Z is correlated with T (testable: first-stage F-statistic > 10). (2) Exclusion restriction — Z affects Y only through T (untestable, requires domain justification). (3) Independence — Z is independent of unobserved confounders. (4) Monotonicity — Z moves T in the same direction for everyone.
-   How to identify: Look for a variable that plausibly affects treatment uptake but has no direct effect on the outcome. Common examples: geographic proximity as instrument for schooling, lottery assignments as instruments for program participation.
-
-8. **frontdoor (Frontdoor Adjustment)**
-   When to use: Unobserved confounders exist between treatment and outcome, but a mediator M exists such that (1) T → M → Y captures the full causal path, (2) there are no unobserved confounders between T and M, and (3) there are no unobserved confounders between M and Y after controlling for T.
-   Estimand: ATE
-   Formula: P(Y|do(T)) = Σ_m P(M=m|T) · Σ_t P(Y|M=m, T=t) · P(T=t)
-   How to identify: Look for a mediator that fully transmits the treatment's effect. Rare in practice. The data description may mention an intermediate step or mechanism.
-
-9. **glm (Generalized Linear Model)**
-   When to use: The outcome is non-linear — binary (logistic regression), count data (Poisson regression), bounded/proportional (beta regression). Confounders are observed.
-   Estimand: Conditional effect (log-odds ratio, incidence rate ratio, etc., depending on the link function)
-   Formula: g(E[Y]) = α + τT + Xβ, where g() is the link function (logit for binary, log for counts).
-   The coefficient τ represents the effect of treatment on the transformed outcome scale.
-   How to identify: Check the outcome variable. If it's binary (0/1), use logistic regression. If it's a count (0, 1, 2, ...), consider Poisson. If it's continuous and unbounded, OLS is likely more appropriate.
-
----
-
-Respond with the five numbered steps below in order. Do not write any introduction, explanation, or preamble before Step 1. Write each step exactly once. Stop after Step 5.
-
-## Step 1: Causal Structure
-Using the study description and dataset columns, identify:
-- treatment: <column_name>
-- outcome: <column_name>
-- controls: [<col1>, <col2>, ...]
-- instrument: <column_name> or none
-- running_variable: <column_name> or none
-- time_variable: <column_name> or none
-- group_variable: <column_name> or none
-
-## Step 2: Method Selection
-Based on the study description, data collection process, and the method definitions above, select the most appropriate method. Return exactly one of:
-diff_in_means, ols, ipw, matching, did, rdd, iv, frontdoor, glm
-
-Justify in one sentence based on the study design and the assumptions that can be invoked.
-
-## Step 3: Estimation Specification
-Write the formal estimation setup:
-- The regression formula or procedure
-- The estimand (ATE, ATT, LATE, etc.)
-- The key identification assumption being invoked
-
-## Step 4: Compute
-Using the estimation specification from Step 3 and the data summary above (column types, summary statistics, sample rows), compute the effect estimate numerically. Show the arithmetic step by step — substitute values and simplify to a final number.
-
-## Step 5: Answer
-Report the estimated effect as a single number.
-"""
-
-
-for d in [OUTPUT_DIR, SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR]:
+for d in [SFT_LORA_OUTPUT_DIR, SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 POLICY_MODEL       = "Qwen/Qwen3-8B"
-TRAIN_BATCH_SIZE   = 4
 MAX_PROMPT_LEN     = 4096
 TRAIN_MAX_TOKENS   = 1200
 LR                 = 2e-5
@@ -300,7 +174,9 @@ def build_sequence(prompt: str, thinking: str, answer: str) -> dict:
         input_ids  : (L,)   full token sequence
         loss_mask  : (L,)   0=ignore, 1=thinking CE, LAMBDA=answer CE
     """
-    messages = [{"role": "user", "content": prompt}]
+    messages = [
+        {"role": "system","content": "You are a causal reasoning expert and a helpful assistant. Don't explain. just do the task"},
+        {"role": "user", "content": prompt}]
 
     # apply_chat_template with enable_thinking=True ends with:
     # <|im_start|>assistant\n<think>\n
@@ -434,28 +310,29 @@ def format_groundtruth(gt: dict) -> str:
 
 TOKENIZED_CACHE = SFT_LORA_OUTPUT_DIR / "tokenized_data.pt"
 
-def load_and_tokenize_cladder(local_rank: int) -> tuple[CladderDataset, CladderDataset]:
-    if not TOKENIZED_CACHE.exists():
-        if local_rank == 0:
-            train_samples, test_samples = [], []
-            for path, bucket in tqdm([(TRAIN_DATA, train_samples), (TEST_DATA, test_samples)]):
-                with open(path, "r") as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if item["source"] != "cladder":
-                            continue
-                        seq = build_sequence(
-                            prompt   = item["prompt"],
-                            thinking = format_groundtruth(item["groundtruth"]),
-                            answer   = item["label"],
-                        )
-                        bucket.append(seq)
-            print(f"Train: {len(train_samples)} | Test: {len(test_samples)} CLaDDer samples.")
-            torch.save({"train": train_samples, "test": test_samples}, TOKENIZED_CACHE)
-            print(f"Saved tokenized data → {TOKENIZED_CACHE}")
-        dist.barrier()
+def load_and_tokenize_cladder() -> tuple[CladderDataset, CladderDataset]:
+    if not os.path.exists(TOKENIZED_CACHE):
+        train_samples, test_samples = [], []
+        for path, bucket in tqdm([(TRAIN_DATA, train_samples), (TEST_DATA, test_samples)]):
+            with open(path, "r") as f:
+                for line in tqdm(f):
+                    item = json.loads(line)
+                    # REMOVE LATER #################
+                    if item["source"] != "cladder":#
+                        continue                   #
+                    ################################
+                    seq = build_sequence(
+                        prompt   = item["prompt"],
+                        thinking = format_groundtruth(item["groundtruth"]),
+                        answer   = item["label"],
+                    )
+                    train_samples.append(seq) if path == TRAIN_DATA else test_samples.append(seq)
+        print(f"Train: {len(train_samples)} | Test: {len(test_samples)} CLaDDer samples.")
+        tmp = str(TOKENIZED_CACHE) + f".{os.getpid()}.tmp"
+        torch.save({"train": train_samples, "test": test_samples}, tmp)
+        os.replace(tmp, TOKENIZED_CACHE)  # atomic — identical content across ranks, last writer wins
 
-    saved = torch.load(TOKENIZED_CACHE, weights_only=False)
+    saved = torch.load(TOKENIZED_CACHE, weights_only=False, map_location="cpu")
     return CladderDataset(saved["train"]), CladderDataset(saved["test"])
 
 # ── Optimizer ──────────────────────────────────────────────────────────────────
@@ -488,7 +365,7 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
             answer_pos = answer_positions[0].item()
 
             with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-                outputs = ddp_model(input_ids=input_ids, attention_mask=attention_mask)
+                outputs = ddp_model.module(input_ids=input_ids, attention_mask=attention_mask)
 
             # logits at answer_pos - 1 predicts the token at answer_pos
             answer_logits = outputs.logits[0, answer_pos - 1, :]
@@ -505,112 +382,165 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
     ddp_model.train()
     return accuracy
 
+import traceback 
+
 # ── Training Loop ──────────────────────────────────────────────────────────────
-def train():
+def train(train_dataset, test_dataset):
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     device     = f"cuda:{local_rank}"
     torch.cuda.set_device(local_rank)
 
-    # ── QLoRA BnB Config ───────────────────────────────────────────────────────
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=DTYPE,
-        bnb_4bit_use_double_quant=True,
-    )
+    try:
+        # ── QLoRA BnB Config ───────────────────────────────────────────────────────
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=DTYPE,
+            bnb_4bit_use_double_quant=True,
+        )
 
-    # ── Load & Freeze Base Model ───────────────────────────────────────────────
-    model = AutoModelForCausalLM.from_pretrained(
-        POLICY_MODEL,
-        quantization_config=bnb_config,
-        device_map={"": local_rank},
-        torch_dtype=DTYPE,
-        attn_implementation="flash_attention_2",
-    )
-    model = prepare_model_for_kbit_training(model)
+        # ── Load & Freeze Base Model ───────────────────────────────────────────────
+        model = AutoModelForCausalLM.from_pretrained(
+            POLICY_MODEL,
+            quantization_config=None,
+            device_map={"": local_rank},
+            torch_dtype=DTYPE,
+            attn_implementation="flash_attention_2",
+        )
+        # model = prepare_model_for_kbit_training(model)
 
-    for param in model.parameters():
-        param.requires_grad = False
+        for param in model.parameters():
+            param.requires_grad = False
 
-    # ── LoRA Config ────────────────────────────────────────────────────────────
-    lora_config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-    )
-    model = get_peft_model(model, lora_config)
-
-    if local_rank == 0:
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total     = sum(p.numel() for p in model.parameters())
-        print(f"Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
-
-    train_dataset, test_dataset = load_and_tokenize_cladder(local_rank)
-
-    train_sampler    = DistributedSampler(train_dataset, shuffle=True)
-    train_dataloader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, sampler=train_sampler, collate_fn=collate_fn)
-    test_dataloader  = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
-
-    model     = torch.compile(model)
-    ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-
-    optimizer = build_optimizer(ddp_model)
-    ddp_model.train()
-
-    global_step = 0
-    for epoch in range(MAX_EPOCHS):
-        train_sampler.set_epoch(epoch)
-        epoch_loss = 0.0
-        optimizer.zero_grad()
-
-        for step, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
-            input_ids      = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            loss_mask      = batch["loss_mask"].to(device)
-
-            with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-                outputs = ddp_model(input_ids=input_ids, attention_mask=attention_mask)
-                loss    = compute_loss(outputs.logits, input_ids, loss_mask)
-                loss    = loss / GRAD_ACCUM
-
-            loss.backward()
-            epoch_loss += loss.item() * GRAD_ACCUM
-
-            if (step + 1) % GRAD_ACCUM == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in ddp_model.parameters() if p.requires_grad],
-                    MAX_GRAD_NORM,
-                )
-                optimizer.step()
-                optimizer.zero_grad()
-                global_step += 1
-
-                if global_step % LOG_EVERY == 0 and local_rank == 0:
-                    avg = epoch_loss / (step + 1)
-                    print(f"[epoch {epoch+1} | step {global_step}] loss: {avg:.4f}")
-
-                if global_step % SAVE_EVERY == 0 and local_rank == 0:
-                    ckpt_path = SFT_LORA_CHECKPOINT_DIR / f"step_{global_step}"
-                    ddp_model.module.save_pretrained(ckpt_path)
-                    tokenizer.save_pretrained(ckpt_path)
-                    print(f"Checkpoint saved → {ckpt_path}")
+        # ── LoRA Config ────────────────────────────────────────────────────────────
+        lora_config = LoraConfig(
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+        )
+        model = get_peft_model(model, lora_config)
 
         if local_rank == 0:
-            print(f"Epoch {epoch+1} complete. Avg loss: {epoch_loss / len(train_dataloader):.4f}")
-            evaluate(ddp_model, test_dataloader, device)
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total     = sum(p.numel() for p in model.parameters())
+            print(f"Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
-    if local_rank == 0:
-        ddp_model.module.save_pretrained(SFT_LORA_OUTPUT_DIR / "final")
-        tokenizer.save_pretrained(SFT_LORA_OUTPUT_DIR / "final")
-        print("Training complete.")
+        train_sampler    = DistributedSampler(train_dataset, shuffle=True)
+        train_dataloader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, sampler=train_sampler, collate_fn=collate_fn, pin_memory=False)
+        test_dataloader  = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, pin_memory=False)
 
+        ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+        optimizer = build_optimizer(ddp_model)
+        ddp_model.train()
+
+        yes_id = tokenizer.convert_tokens_to_ids("Yes")
+        no_id  = tokenizer.convert_tokens_to_ids("No")
+
+        metric_steps      = []
+        metric_train_loss = []
+        metric_train_acc  = []
+
+        global_step = 0
+        window_loss, window_correct, window_total = 0.0, 0, 0
+
+        for epoch in range(MAX_EPOCHS):
+            train_sampler.set_epoch(epoch)
+            epoch_loss = 0.0
+            optimizer.zero_grad()
+
+            for step, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
+                input_ids      = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                loss_mask      = batch["loss_mask"].to(device)
+
+                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+                    outputs = ddp_model(input_ids=input_ids, attention_mask=attention_mask)
+                    loss    = compute_loss(outputs.logits, input_ids, loss_mask)
+                    loss    = loss / GRAD_ACCUM
+
+                # Compute train accuracy before backward (logits freed after backward)
+                with torch.no_grad():
+                    for i in range(input_ids.shape[0]):
+                        ans_pos_list = (loss_mask[i] == ANSWER_LAMBDA).nonzero(as_tuple=True)[0]
+                        if len(ans_pos_list) == 0:
+                            continue
+                        ans_pos  = ans_pos_list[0].item()
+                        pred_idx = outputs.logits[i, ans_pos - 1, [yes_id, no_id]].argmax().item()
+                        pred_tok = yes_id if pred_idx == 0 else no_id
+                        if pred_tok == input_ids[i, ans_pos].item():
+                            window_correct += 1
+                        window_total += 1
+
+                loss.backward()
+                window_loss  += loss.item() * GRAD_ACCUM
+                epoch_loss   += loss.item() * GRAD_ACCUM
+
+                if (step + 1) % GRAD_ACCUM == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in ddp_model.parameters() if p.requires_grad],
+                        MAX_GRAD_NORM,
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+                    if global_step % LOG_EVERY == 0 and local_rank == 0:
+                        avg = epoch_loss / (step + 1)
+                        print(f"[epoch {epoch+1} | step {global_step}] loss: {avg:.4f}")
+
+                    if global_step % SAVE_EVERY == 0 and local_rank == 0:
+                        train_acc      = window_correct / window_total if window_total > 0 else 0.0
+                        train_loss_avg = window_loss / SAVE_EVERY
+                        metric_steps.append(global_step)
+                        metric_train_loss.append(train_loss_avg)
+                        metric_train_acc.append(train_acc)
+                        window_loss, window_correct, window_total = 0.0, 0, 0
+
+                        ckpt_path = SFT_LORA_CHECKPOINT_DIR / f"step_{global_step}"
+                        ddp_model.module.save_pretrained(ckpt_path)
+                        tokenizer.save_pretrained(ckpt_path)
+                        print(f"Checkpoint saved → {ckpt_path} | train_loss={train_loss_avg:.4f} train_acc={train_acc:.4f}")
+
+            if local_rank == 0:
+                print(f"Epoch {epoch+1} complete. Avg loss: {epoch_loss / len(train_dataloader):.4f}")
+
+        dist.barrier()
+        if local_rank == 0:
+            ddp_model.module.save_pretrained(SFT_LORA_OUTPUT_DIR / "final")
+            tokenizer.save_pretrained(SFT_LORA_OUTPUT_DIR / "final")
+            print("Training complete.")
+        dist.barrier()
+        dist.destroy_process_group()
+
+        if local_rank == 0:
+            test_acc = evaluate(ddp_model, test_dataloader, device)
+            print(f"Final test accuracy: {test_acc:.4f}")
+
+            if metric_steps:
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                axes[0].plot(metric_steps, metric_train_loss); axes[0].set_title("Train Loss");     axes[0].set_xlabel("Step")
+                axes[1].plot(metric_steps, metric_train_acc);  axes[1].set_title("Train Accuracy"); axes[1].set_xlabel("Step")
+                fig.suptitle(f"Final Test Accuracy: {test_acc:.4f}")
+                fig.tight_layout()
+                plot_path = SFT_LORA_PLOT_DIR / "training_curves.png"
+                fig.savefig(plot_path, dpi=100)
+                plt.close(fig)
+                print(f"Plots saved → {plot_path}")
+    except Exception as e:
+        print(f"rank {local_rank} CRACHED: {e}", flush = True)
+        traceback.print_exc()
+        dist.destroy_process_group()
+        raise
 if __name__ == "__main__":
-    preprocess(cladder_prompt=CLADDER_PROMPT, causci_prompt=CAUSCI_PROMPT, output_dir=OUTPUT_DIR)
-    train()
+    # preprocess(cladder_prompt=CLADDER_PROMPT, causci_prompt="CAUSCI_PROMPT {dataset_description} {file_path} {shape} {columns_and_types} {df_head} {df_describe} {missin_values} {low_cardinality} {query}", output_dir=SFT_LORA_OUTPUT_DIR)
+    train_dataset, test_dataset = load_and_tokenize_cladder()
+    
+    train(train_dataset, test_dataset)
