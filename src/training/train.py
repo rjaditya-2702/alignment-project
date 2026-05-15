@@ -128,6 +128,20 @@ class MetricsCallback(TrainerCallback):
 # CONFIG
 # ---------------------------------------------------------------------------
 
+from peft import LoraConfig, get_peft_model, TaskType
+
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=16,                    # rank — 16 is a good start for reasoning tasks
+    lora_alpha=32,           # scaling factor, typically 2x r
+    lora_dropout=0.05,
+    target_modules=[         # Qwen3 attention + MLP projections
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ],
+    bias="none",
+)
+
 training_args = GRPOConfig(
     # --- core ---
     output_dir=OUTPUT_DIR,
@@ -137,7 +151,6 @@ training_args = GRPOConfig(
 
     # --- GRPO-specific ---
     num_generations=N_ROLLOUTS,                 # N rollouts per prompt (the group size)
-    max_prompt_length=4096,
     max_completion_length=3000,
 
     # --- KL penalty ---
@@ -155,7 +168,7 @@ training_args = GRPOConfig(
     report_to="none",                  # swap to "wandb" or "tensorboard"
 
     # --- generation ---
-    generation_kwargs={"enable_thinking": True},
+    # generation_kwargs={"enable_thinking": True},
 
     # --- misc ---
     bf16=True,
@@ -207,15 +220,15 @@ CLADDER_USER_PROMPT = """
 | Type | Formula | Use when |
 |------|---------|----------|
 | marginal | P(Y=y) | Baseline probability of an outcome, no conditions or interventions |
-| correlation | P(Y=y\|X=x) | Observing X changes probability of Y, no intervention |
-| ate | E[Y\|do(X=1)] - E[Y\|do(X=0)] | Forcing X to a value — what is the causal effect on Y |
+| correlation | P(Y=y\\|X=x) | Observing X changes probability of Y, no intervention |
+| ate | E[Y\\|do(X=1)] - E[Y\\|do(X=0)] | Forcing X to a value — what is the causal effect on Y |
 | backadj | Does set S block all backdoor paths X→Y? | Question asks whether adjusting for a variable set is valid |
-| det-counterfactual | P(Y_x=y \| evidence) | What would Y have been if X were different, given observed facts |
-| ett | E[Y₁-Y₀ \| X=1] | Among those who received treatment, what if they hadn't |
+| det-counterfactual | P(Y_x=y \\| evidence) | What would Y have been if X were different, given observed facts |
+| ett | E[Y₁-Y₀ \\| X=1] | Among those who received treatment, what if they hadn't |
 | nde | E[Y_{1,M₀} - Y_{0,M₀}] | Direct effect of X on Y, holding mediator at its natural value |
 | nie | E[Y_{0,M₁} - Y_{0,M₀}] | Indirect effect of X on Y, only through the mediator |
 | collider_bias | Does do(X) affect Y when Z is a collider? | X and Y share only a common effect, no common cause |
-| exp_away | Does P(Y\|X) change when conditioning on collider Z? | Conditioning on a common effect creates spurious association |
+| exp_away | Does P(Y\\|X) change when conditioning on collider Z? | Conditioning on a common effect creates spurious association |
 
 ## Estimation Rules
 
@@ -252,13 +265,13 @@ Step 4 — Compute: Substitute every numeric value from the scenario into the es
 
 Then output this JSON and nothing else:
 
-{
+{{
   "step1": "<variable assignments and all directed edges>",
   "step2": "<query type>",
   "step3": "<estimand expression>",
   "step4": "<full arithmetic or graph reasoning, final value at the end>",
   "step5": "<yes or no>"
-}
+}}
 """
 
 CAUSCI_SYSTEM_PROMPT = """You are a causal inference expert. Analyze the study design carefully 
@@ -335,8 +348,8 @@ Think through the following before answering:
 
 Then output this JSON and nothing else after your thinking:
 
-{
-  "step1": {
+{{
+  "step1": {{
     "treatment": "<exact column name>",
     "outcome": "<exact column name>",
     "controls": ["<col1>", "<col2>"],
@@ -347,9 +360,9 @@ Then output this JSON and nothing else after your thinking:
     "group_variable": null,
     "mediator": null,
     "estimand": "<ATE, ATT, ATC, LATE, or conditional>"
-  },
+  }},
   "step2": "<method name>"
-}
+}}
 """
 
 
@@ -375,7 +388,13 @@ def load_dataset_for_grpo() -> Dataset:
             csv_path = ""
         else:
             system_prompt = CAUSCI_SYSTEM_PROMPT
-            csv_path = _resolve_csv_path(r["csv_path"])
+            if "csv_path" in r:
+                csv_path = _resolve_csv_path(r["csv_path"])
+            else:
+                # preprocess crashed before writing csv_path — extract from prompt's "Path: " line
+                m = re.search(r"^Path: (.+)$", r["prompt"], re.MULTILINE)
+                assert m, f"No 'Path: ' line in causcibench prompt for row {r.get('id')}"
+                csv_path = _resolve_csv_path(m.group(1).strip())
             dataset_columns = pd.read_csv(csv_path, nrows=0).columns.tolist()
 
         messages = [
@@ -758,7 +777,8 @@ def main():
         reward_funcs=reward_fn,        # can also be a list for multiple signals
         train_dataset=dataset,
         processing_class=tokenizer,
-        callbacks=[metrics_callback]
+        callbacks=[metrics_callback],
+        peft_config=lora_config,
     )
 
     trainer.train()
@@ -773,5 +793,15 @@ def main():
 
 
 if __name__ == "__main__":
-    preprocess(cladder_prompt=CLADDER_USER_PROMPT, causci_prompt=CAUSCI_USER_PROMPT, output_dir=Path(OUTPUT_DIR_RL))
+    import os, fcntl
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    os.makedirs(OUTPUT_DIR_RL, exist_ok=True)
+    with open(Path(OUTPUT_DIR_RL) / ".preprocess.lock", "w") as lf:
+        if local_rank == 0:
+            fcntl.flock(lf, fcntl.LOCK_EX)   # exclusive: blocks all other ranks
+            preprocess(cladder_prompt=CLADDER_USER_PROMPT, causci_prompt=CAUSCI_USER_PROMPT, output_dir=Path(OUTPUT_DIR_RL))
+            # lock released on context-manager exit
+        else:
+            fcntl.flock(lf, fcntl.LOCK_SH)   # shared: blocks until rank0's LOCK_EX is released
+            # lock released on context-manager exit
     main()

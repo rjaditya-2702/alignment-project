@@ -19,9 +19,17 @@ Two training approaches are implemented, each with its own prompt format and out
 
 **Script:** `src/training/train.py`
 
-Uses TRL's `GRPOTrainer` with vLLM for rollout generation. For each prompt, N completions are sampled, scored by a reward function, and the policy is updated via Group Relative Policy Optimization with a KL penalty against the base model.
+Uses TRL's `GRPOTrainer` with vLLM in colocate mode for rollout generation. For each prompt, N completions are sampled, scored by a reward function, and the policy is updated via Group Relative Policy Optimization with a KL penalty against the base model.
 
-The prompt asks the model to reason inside a `<think>` block and return a structured JSON object with all 5 steps.
+The model reasons inside a `<think>` block (Qwen3 thinking mode enabled via `enable_thinking=True`) and returns a structured JSON object with all 5 steps. The `<think>\n` prefill is injected into every prompt before generation.
+
+**Reward functions:**
+
+- *CLadder*: cascade scoring — step1 (graph, judge), step2 (query type, exact match), step3 (estimand, judge), step5 (answer, exact match). Wrong graph → −1.0 immediately; wrong query type → −0.5 immediately; wrong estimand applies a −0.25 penalty to the final score.
+- *CauSciBench*: cascade scoring — method (exact match), treatment/outcome (exact match), controls overlap (≥0.75 threshold), effect accuracy (within 5% of reference via estimation library). Wrong method → −1.0 immediately; wrong treatment or outcome → −0.5 immediately.
+- Parse failure (malformed JSON) → −1.0 for both benchmarks.
+
+**Judge:** `Qwen/Qwen2.5-72B-Instruct` served as a local vLLM API on port 8001 (GPU 2-3). Scores step1 and step3 for CLadder (binary 0/1).
 
 Output: `src/output_RL/`
 
@@ -43,11 +51,22 @@ The two training methods use different prompt templates defined in their respect
 
 ---
 
+## Hardware
+
+4 × GH200 GPUs (96 GB HBM3 each, 384 GB total).
+
+| GPUs | Role |
+|------|------|
+| 0–1 | Qwen3-8B policy — TRL training + vLLM rollout (colocate mode) |
+| 2–3 | Qwen2.5-72B-Instruct judge — frozen vLLM inference server |
+
+---
+
 ## Policy model
 
-`Qwen/Qwen3-8B` with QLoRA adapters (r=32, all attention + MLP projections).
+`Qwen/Qwen3-8B` with thinking mode enabled.
 
-Judge for reward scoring: `deepseek-ai/deepseek-math-7b-instruct` (RL only).
+Judge for reward scoring: `Qwen/Qwen2.5-72B-Instruct` (RL only, local vLLM server).
 
 ---
 
@@ -74,6 +93,9 @@ src/
 
   training/
     train.py                   — GRPO training loop (TRL + vLLM)
+    tool_calling.py            — estimation library: loads CSV, runs the correct estimator
+                                 (OLS, IPW, matching, DiD, RDD, IV, frontdoor, GLM),
+                                 returns float effect estimate for CauSciBench reward scoring
 
   output_RL/                   — written by train.py
     train.jsonl / test.jsonl   — preprocessed data (RL prompt format)
@@ -100,11 +122,29 @@ dataset/
 
 ### RL training (GRPO)
 
+**Step 1 — Launch the judge server on GPU 2-3:**
+
 ```bash
-python src/training/train.py
+CUDA_VISIBLE_DEVICES=2,3 vllm serve Qwen/Qwen2.5-72B-Instruct \
+    --port 8001 \
+    --tensor-parallel-size 2 \
+    --gpu-memory-utilization 0.85 \
+    --dtype bfloat16
 ```
 
-Runs preprocessing with the RL prompt, then starts GRPO training. Everything is configured in `src/config.py`.
+**Step 2 — Once the server is ready, start training on GPU 0-1:**
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 src/training/train.py
+```
+
+This runs preprocessing with the RL prompt first, then starts GRPO training. Everything is configured in `src/config.py`.
+
+**Or submit as a SLURM job (handles both steps automatically):**
+
+```bash
+sbatch run_rl_script.sh
+```
 
 Checkpoints saved every `SAVE_EVERY` steps and at end of each epoch. Final weights: `src/output_RL/checkpoints/final/`.
 

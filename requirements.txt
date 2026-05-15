@@ -1,7 +1,34 @@
-trl
-vllm
-matplotlib
-peft
+# Core training
+torch
 transformers
-flash-sttn
+trl
+peft
+accelerate
+datasets
+
+# vLLM (rollout engine + judge server)
+vllm
+
+# Judge client
+openai
+
+# Causal estimation library (tool_calling.py)
+numpy
+pandas
+statsmodels
 scikit-learn
+linearmodels
+scipy
+rdd
+
+# Plotting
+matplotlib
+
+# Efficient attention (required for Qwen3)
+flash-attn
+
+# Progress bars
+tqdm
+
+# QLoRA quantization (SFT)
+bitsandbytes
