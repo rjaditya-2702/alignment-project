@@ -38,8 +38,8 @@ SFT_CHECKPOINT_DIR = ROOT / "src" / "output_fine_tune" / "checkpoints"
 # ── Training hyperparameters ──────────────────────────────────────────────────
 
 TRAIN_BATCH_SIZE = 3     # prompts per training step
-N_ROLLOUTS       = 6       # completions per prompt
-MAX_PROMPT_LEN   = 3072    # truncate prompt to this many tokens
+N_ROLLOUTS       = 9       # completions per prompt
+MAX_PROMPT_LEN   = 4000    # truncate prompt to this many tokens
 TRAIN_MAX_TOKENS = 1024    # max completion length during training
 TEMPERATURE      = 0.8
 TOP_P            = 0.9
@@ -54,7 +54,7 @@ MAX_EPOCHS       = 3
 SAVE_EVERY       = 500     # global steps between checkpoints
 LOG_EVERY        = 10      # global steps between log lines
 
-LORA_R           = 32
+LORA_R           = 16
 IS_CLIP_RANGE    = (0.5, 2.0)   # importance sampling ratio clamp (min, max)
 
 # ── Eval hyperparameters ──────────────────────────────────────────────────────

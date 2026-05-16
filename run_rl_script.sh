@@ -26,9 +26,10 @@ fi
 # VLLM_USE_TRITON_FLASH_ATTN=0: flash_attn_2_cuda is not compiled for GH200 (sm_90a/aarch64);
 # disabling triton flash attn makes vLLM fall back to native PyTorch attention for rotary embeddings.
 echo "Starting judge server..."
-CUDA_VISIBLE_DEVICES=2,3 vllm serve Qwen/Qwen2.5-72B-Instruct \
+# Qwen/Qwen2.5-72B-Instruct
+CUDA_VISIBLE_DEVICES=3 vllm serve Qwen/Qwen3-8B \
     --port 8001 \
-    --tensor-parallel-size 2 \
+    --tensor-parallel-size 1 \
     --gpu-memory-utilization 0.85 \
     --dtype bfloat16 > judge_server.log 2>&1 &
 
@@ -57,6 +58,6 @@ done
 echo "Judge server ready."
 
 # Run policy training on GPU 0-1
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 ./src/training/train.py
+CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3 ./src/training/train.py
 
 kill $JUDGE_PID

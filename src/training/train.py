@@ -19,13 +19,17 @@ def _resolve_csv_path(stored: str) -> str:
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import torch
+from functools import lru_cache
+# from openai import AsyncOpenAI
 from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datasets import Dataset
 from transformers import AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
+from peft import LoraConfig, TaskType
 
 from src.data.preprocess import preprocess
-
 from src.config import (
     POLICY_MODEL as MODEL_NAME, 
     OUTPUT_DIR_RL,
@@ -35,8 +39,11 @@ from src.config import (
     TEST_DATA_RL as TEST_DATA,
     TRAIN_BATCH_SIZE,
     N_ROLLOUTS,
-    FINAL_MODEL
+    FINAL_MODEL,
+    TRAIN_MAX_TOKENS,
+    MAX_PROMPT_LEN
 )
+from src.training.tool_calling import library_fn
 
 # ---------------------------------------------------------------------------
 # CALLBACK: collect metrics during training
@@ -124,11 +131,14 @@ class MetricsCallback(TrainerCallback):
         plt.show()
         print(f"Plot saved to {save_path}")
 
+class MemoryCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        torch.cuda.empty_cache()
+        # torch.cuda.synchronize()
+
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-
-from peft import LoraConfig, get_peft_model, TaskType
 
 lora_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
@@ -151,7 +161,8 @@ training_args = GRPOConfig(
 
     # --- GRPO-specific ---
     num_generations=N_ROLLOUTS,                 # N rollouts per prompt (the group size)
-    max_completion_length=3000,
+    max_completion_length=TRAIN_MAX_TOKENS,   # 1024
+    # max_prompt_length=MAX_PROMPT_LEN,         # 3072 
 
     # --- KL penalty ---
     beta=0.04,                         # weight on KL(π_θ ∥ π_ref); 0 disables it
@@ -160,7 +171,7 @@ training_args = GRPOConfig(
     use_vllm=True,
     vllm_mode="colocate",              # shares GPUs with training; use "server"
                                        # if you have dedicated inference GPUs
-    vllm_gpu_memory_utilization=0.4,   # leave headroom for training weights
+    vllm_gpu_memory_utilization=0.5,   # leave headroom for training weights
 
     # --- logging / saving ---
     logging_steps=10,
@@ -173,6 +184,8 @@ training_args = GRPOConfig(
     # --- misc ---
     bf16=True,
     seed=42,
+    dataloader_pin_memory=True,
+    dataloader_num_workers=4,
 )
 
 # ---------------------------------------------------------------------------
@@ -183,30 +196,68 @@ training_args = GRPOConfig(
 #       --gpu-memory-utilization 0.85 --dtype bfloat16
 # ---------------------------------------------------------------------------
 
-judge_client = OpenAI(
-    base_url="http://localhost:8001/v1",
-    api_key="token",
-)
+# _async_judge = AsyncOpenAI(base_url="http://localhost:8001/v1", api_key="token")
 
-def judge_fn(prompt: str) -> float:
-    """Call the local judge server; return 1.0/0.0 score or 0.0 on parse failure."""
-    response = judge_client.chat.completions.create(
-        model="Qwen/Qwen2.5-72B-Instruct",
-        max_tokens=10,
-        temperature=0.0,
-        messages=[{"role": "user", "content": prompt}],
-    )
+# async def _judge_one(prompt: str) -> float:
+#     r = await _async_judge.chat.completions.create(
+#         model=JUDGE_MODEL,
+#         max_tokens=2,
+#         temperature=0.0,
+#         messages=[
+#             {"role": "system", "content": "You are a binary scorer. Reply with only 0 or 1. No other text."},
+#             {"role": "user", "content": prompt}
+#         ],
+#     )
+#     raw = r.choices[0].message.content
+#     raw = raw.strip()
+#     raw = re.sub(r'[^01]', '', raw)   # strip everything except 0 and 1
+#     return float(int(raw[0]))          # take first character, convert
+
+# def batch_judge(prompts: list[str]) -> list[float]:
+#     """Fire all judge calls concurrently, return results in order."""
+#     return asyncio.run(asyncio.gather(*[_judge_one(p) for p in prompts]))
+    
+# def batch_judge(prompts: list[str]) -> list[float]:
+#     results = []
+
+#     def _run():
+#         loop = asyncio.new_event_loop()
+#         asyncio.set_event_loop(loop)
+#         try:
+#             results.extend(loop.run_until_complete(asyncio.gather(*[_judge_one(p) for p in prompts])))
+#         finally:
+#             loop.close()
+
+#     t = threading.Thread(target=_run)
+#     t.start()
+#     t.join()
+#     return results
+
+
+_judge_client = OpenAI(base_url="http://localhost:8001/v1", api_key="token")
+
+def _judge_one(prompt: str) -> float:
     try:
-        return float(response.choices[0].message.content.strip())
-    except:
+        r = _judge_client.chat.completions.create(
+            model=JUDGE_MODEL,
+            max_tokens=2,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": "You are a binary scorer. Reply with only 0 or 1. No other text."},
+                {"role": "user",   "content": prompt},
+            ],
+        )
+        raw = re.sub(r'[^01]', '', r.choices[0].message.content.strip())
+        return float(int(raw[0]))
+    except Exception:
         return 0.0
 
-# ---------------------------------------------------------------------------
-# ESTIMATION LIBRARY
-# ---------------------------------------------------------------------------
-
-from src.training.tool_calling import library_fn
-
+def batch_judge(prompts: list[str]) -> list[float]:
+    if not prompts:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(prompts), 16)) as pool:
+        futures = [pool.submit(_judge_one, p) for p in prompts]
+        return [f.result() for f in futures]
 # ---------------------------------------------------------------------------
 # 1. DATA LOADING  ← fill this in
 # ---------------------------------------------------------------------------
@@ -365,8 +416,6 @@ Then output this JSON and nothing else after your thinking:
 }}
 """
 
-
-
 def load_dataset_for_grpo() -> Dataset:
     """
     Load preprocessed JSONL and return a HuggingFace Dataset.
@@ -411,81 +460,34 @@ def load_dataset_for_grpo() -> Dataset:
         })
     return Dataset.from_list(new_data)
 
-
 # ---------------------------------------------------------------------------
 # 2. REWARD FUNCTION  ← fill this in
 # ---------------------------------------------------------------------------
-def reward_cladder(prediction: dict, ground_truth: dict, judge_fn) -> float:
-    
-    scores = {}
-    
-    # step1 — causal graph: judge, binary
-    step1_prompt = f"""
+
+def _make_step1_prompt(parsed: dict, gt: dict) -> str:
+    return f"""
 You are a causal inference expert.
-Predicted causal graph: {prediction.get('step1', '')}
-Reference causal graph: {ground_truth.get('step1', '')}
+Return 1 if correct, 0 if wrong. Nothing else. You have just 1 token to respond.
+Predicted causal graph: {parsed.get('step1', '')}
+Reference causal graph: {gt.get('step1', '')}
 
 Does the predicted graph correctly identify:
 1. The right variables
 2. All directed edges in the correct direction
 3. No spurious edges added
-
-Return 1 if correct, 0 if wrong. Nothing else.
 """
-    scores['step1'] = int(round(judge_fn(step1_prompt)))
 
-    # cascade gate — step1 is the foundation
-    # wrong graph means model is not doing causal reasoning
-    # penalize hard and stop
-    if scores['step1'] == 0:
-        return -1.0, scores
-
-    # step2 — query type: exact match, binary
-    pred_step2 = prediction.get('step2', '').strip().lower()
-    ref_step2  = ground_truth.get('step2', '').strip().lower()
-    scores['step2'] = 1 if pred_step2 == ref_step2 else 0
-
-    # cascade gate — wrong query type means 
-    # estimand will be wrong, answer may be lucky
-    # zero out downstream but don't penalize as hard as step1
-    if scores['step2'] == 0:
-        scores['step3'] = 0
-        scores['step5'] = 0
-        return -0.5, scores
-
-    # step3 — estimand: judge, binary
-    step3_prompt = f"""
-You are a causal inference expert.
-Query type: {ground_truth.get('step2', '')}
-Predicted estimand: {prediction.get('step3', '')}
-Reference estimand: {ground_truth.get('step3', '')}
+def _make_step3_prompt(parsed: dict, gt: dict) -> str:
+    return f"""
+You are a causal inference expert. 
+Return 1 if equivalent, 0 if wrong. Nothing else. You have just 1 token to respond.
+Query type: {gt.get('step2', '')}
+Predicted estimand: {parsed.get('step3', '')}
+Reference estimand: {gt.get('step3', '')}
 
 Are these mathematically equivalent?
-Return 1 if equivalent, 0 if wrong. Nothing else.
 """
-    scores['step3'] = int(round(judge_fn(step3_prompt)))
 
-    # step3 wrong — model identified the right query type
-    # but couldn't formalize it. step5 may still be lucky.
-    # small penalty but still score step5
-    step3_penalty = 0.0 if scores['step3'] == 1 else -0.25
-
-    # step5 — final answer: exact match, binary
-    pred_step5 = prediction.get('step5', '').strip().lower()
-    ref_step5  = ground_truth.get('step5', '').strip().lower()
-    scores['step5'] = 1 if pred_step5 == ref_step5 else 0
-
-    # final reward
-    if scores['step5'] == 1:
-        # correct answer — reward scales with how clean the reasoning was
-        base = 1.0
-        reward = base + step3_penalty  # 1.0 or 0.75
-    else:
-        # wrong answer despite correct graph + query type
-        # harder penalty — model had everything it needed
-        reward = -0.75 + step3_penalty  # -0.75 or -1.0
-
-    return reward, scores
 
 def reward_causci(
     prediction: dict,
@@ -554,32 +556,105 @@ def reward_causci(
 
     return reward, scores
 
-def reward_fn(completions: list[str], **kwargs) -> list[float]:
-    """
-    Score each completion. Called by GRPOTrainer with batch * num_generations items.
+def reward_cladder_precomputed(prediction: dict, ground_truth: dict, s1_score: int, s3_score: int | None) -> tuple[float, dict]:
+    scores = {}
 
-    kwargs contains dataset columns aligned with completions:
-      - source: "cladder" or "causcibench"
-      - groundtruth: dict with step1..step5
-      - dataset_columns: list of CSV column names (causcibench only)
-    """
+    scores['step1'] = s1_score
+    if scores['step1'] == 0:
+        return -1.0, scores
+
+    pred_step2 = prediction.get('step2', '').strip().lower()
+    ref_step2  = ground_truth.get('step2', '').strip().lower()
+    scores['step2'] = 1 if pred_step2 == ref_step2 else 0
+
+    if scores['step2'] == 0:
+        scores['step3'] = 0
+        scores['step5'] = 0
+        return -0.5, scores
+
+    scores['step3'] = s3_score if s3_score is not None else 0
+    step3_penalty = 0.0 if scores['step3'] == 1 else -0.25
+
+    pred_step5 = prediction.get('step5', '').strip().lower()
+    ref_step5  = ground_truth.get('step5', '').strip().lower()
+    scores['step5'] = 1 if pred_step5 == ref_step5 else 0
+
+    if scores['step5'] == 1:
+        reward = 1.0 + step3_penalty
+    else:
+        reward = -0.75 + step3_penalty
+
+    return reward, scores
+
+@lru_cache(maxsize=512)
+def cached_library_fn(csv_path, method, treatment, outcome, controls_tuple):
+    return library_fn(csv_path, method, treatment, outcome, controls_tuple)
+
+def reward_fn(completions: list, **kwargs) -> list[float]:
     sources      = kwargs["source"]
     groundtruths = kwargs["groundtruth"]
     dataset_cols = kwargs["dataset_columns"]
     csv_paths    = kwargs["csv_path"]
 
-    rewards = []
+    # Phase 1 — parse all completions
+    items = []
     for completion, source, gt, cols, csv_path in zip(
         completions, sources, groundtruths, dataset_cols, csv_paths
     ):
+        if isinstance(completion, list):
+            completion = completion[-1]["content"]
         gt = json.loads(gt)
+        parsed = extract_cladder(completion) if source == "cladder" else extract_causci(completion, cols)
+        items.append((source, parsed, gt, cols, csv_path))
+
+    # Phase 2 — collect judge prompts for all cladder items and fire concurrently
+    # step1 always needed; step3 only if step2 is an exact match (avoids a wasted call)
+    judge_prompts = []
+    prompt_idx = {}  # item index → {"step1": int, "step3": int}
+
+    for i, (source, parsed, gt, cols, csv_path) in enumerate(items):
+        if source != "cladder" or parsed is None:
+            continue
+        prompt_idx[i] = {}
+        prompt_idx[i]["step1"] = len(judge_prompts)
+        judge_prompts.append(_make_step1_prompt(parsed, gt))
+        if parsed.get('step2', '').strip().lower() == gt.get('step2', '').strip().lower():
+            prompt_idx[i]["step3"] = len(judge_prompts)
+            judge_prompts.append(_make_step3_prompt(parsed, gt))
+
+    judge_scores = batch_judge(judge_prompts) if judge_prompts else []
+
+    # Phase 3 — score using pre-fetched judge results
+    rewards = []
+    for i, (source, parsed, gt, cols, csv_path) in enumerate(items):
         if source == "cladder":
-            reward, _ = safe_reward_cladder(completion, gt, judge_fn)
+            if parsed is None:
+                rewards.append(-1.0)
+                continue
+            idxs = prompt_idx.get(i, {})
+            s1 = int(round(judge_scores[idxs["step1"]])) if "step1" in idxs else 0
+            s3 = int(round(judge_scores[idxs["step3"]])) if "step3" in idxs else None
+            reward, _ = reward_cladder_precomputed(parsed, gt, s1, s3)
+
         elif source == "causcibench":
-            reward, _ = safe_reward_causci(completion, gt, cols, csv_path, library_fn)
+            if parsed is None:
+                rewards.append(-1.0)
+                continue
+            step1 = parsed["step1"]
+            library_effect = cached_library_fn(
+                csv_path,
+                parsed["step2"],
+                step1["treatment"],
+                step1["outcome"],
+                tuple(step1["controls"]),
+            )
+            reward, _ = reward_causci(parsed, gt, library_effect)
+
         else:
             raise ValueError(f"Unknown source: {source!r}")
+
         rewards.append(reward)
+
     return rewards
 
 def extract_json(model_output: str) -> dict | None:
@@ -731,19 +806,6 @@ def extract_causci(model_output: str, dataset_columns: list[str]) -> dict | None
         'step2': method,
     }
 
-def safe_reward_cladder(model_output, ground_truth, judge_fn):
-    parsed = extract_cladder(model_output)
-    if parsed is None:
-        return -1.0, {'parse_error': True}
-    return reward_cladder(parsed, ground_truth, judge_fn)
-
-def safe_reward_causci(model_output, ground_truth, dataset_columns, csv_path, library_fn):
-    parsed = extract_causci(model_output, dataset_columns)
-    if parsed is None:
-        return -1.0, {'parse_error': True}
-    parsed["step1"]["csv_path"] = csv_path
-    library_effect = library_fn(parsed)
-    return reward_causci(parsed, ground_truth, library_effect)
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +831,7 @@ def main():
     # print("Reward sanity check:", reward_fn(dummy))
 
     metrics_callback = MetricsCallback()
+    memory_callback  = MemoryCallback()
 
     # --- trainer ---
     trainer = GRPOTrainer(
@@ -777,7 +840,7 @@ def main():
         reward_funcs=reward_fn,        # can also be a list for multiple signals
         train_dataset=dataset,
         processing_class=tokenizer,
-        callbacks=[metrics_callback],
+        callbacks=[metrics_callback, memory_callback],
         peft_config=lora_config,
     )
 
