@@ -37,7 +37,7 @@ SFT_CHECKPOINT_DIR = ROOT / "src" / "output_fine_tune" / "checkpoints"
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
 
-TRAIN_BATCH_SIZE = 1     # prompts per training step
+TRAIN_BATCH_SIZE = 2     # prompts per training step
 N_ROLLOUTS       = 6       # completions per prompt
 MAX_PROMPT_LEN   = 4000    # truncate prompt to this many tokens
 TRAIN_MAX_TOKENS = 1024    # max completion length during training

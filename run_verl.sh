@@ -25,23 +25,25 @@ echo "Data preparation complete."
 # ── Judge server (GPU 3) — thinking DISABLED, we just need 0/1 scoring ────
 echo "Starting judge server on GPU 3..."
 
+# for some reason, I can't vllm and verl to sit together!
+
 # CUDA_VISIBLE_DEVICES=3 vllm serve Qwen/Qwen3-8B \
 #     --port 8001 \
 #     --tensor-parallel-size 1 \
-#     --gpu-memory-utilization 0.85 \
+#     --gpu-memory-utilization 0.4 \
 #     --dtype bfloat16 \
 #     --override-generation-config '{"enable_thinking": false}' \
 #     > judge_server.log 2>&1 &
 
-export VLLM_ATTENTION_BACKEND=TORCH_SDPA
-export TRANSFORMERS_NO_FLASH_ATTN=1
-export TRANSFORMERS_ATTN_IMPLEMENTATION=sdpa
+# export VLLM_ATTENTION_BACKEND=TORCH_SDPA
+# export TRANSFORMERS_NO_FLASH_ATTN=1
+# export TRANSFORMERS_ATTN_IMPLEMENTATION=sdpa
 
 CUDA_VISIBLE_DEVICES=3 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --port 8001 \
     --tp 1 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.4 \
     --dtype bfloat16 \
     --attention-backend torch_native \
     > judge_server.log 2>&1 &

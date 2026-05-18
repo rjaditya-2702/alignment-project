@@ -56,6 +56,6 @@ done
 echo "Judge server ready."
 
 # Run policy training on GPU 0-1
-CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3 ./src/training/train.py
+CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3 src/training/train_trl.py
 
 kill $JUDGE_PID

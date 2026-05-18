@@ -194,7 +194,11 @@ training_args = GRPOConfig(
     dataloader_pin_memory=True,
     dataloader_num_workers=4,
     dataloader_persistent_workers=True,
-    shuffle_dataset=True
+    shuffle_dataset=True,
+
+    # --- evaluation during training ---
+    evaluation_strategy="steps",
+    eval_steps=1000,
 )
 
 # _async_judge = AsyncOpenAI(base_url="http://localhost:8001/v1", api_key="token")
@@ -417,7 +421,7 @@ Then output this JSON and nothing else after your thinking:
 }}
 """
 
-def load_dataset_for_grpo() -> Dataset:
+def load_dataset_for_grpo(path) -> Dataset:
     """
     Load preprocessed JSONL and return a HuggingFace Dataset.
 
@@ -427,7 +431,7 @@ def load_dataset_for_grpo() -> Dataset:
       - groundtruth: dict with step1..step5
       - dataset_columns: list of CSV column names (causcibench only, else [])
     """
-    with open(TRAIN_DATA, "r") as f:
+    with open(path, "r") as f:
         raw = [json.loads(line) for line in f]
 
     new_data = []
@@ -822,7 +826,8 @@ def main():
     )
 
     # --- data ---
-    dataset = load_dataset_for_grpo()
+    dataset = load_dataset_for_grpo(TRAIN_DATA)
+    test_dataset = load_dataset_for_grpo(TEST_DATA)
     assert "prompt" in dataset.column_names, (
         "Dataset must have a 'prompt' column (list of chat messages per row)."
     )
@@ -840,6 +845,7 @@ def main():
         args=training_args,
         reward_funcs=reward_fn,        # can also be a list for multiple signals
         train_dataset=dataset,
+        eval_dataset=test_dataset,          # optional — can be a different dataset or None
         processing_class=tokenizer,
         callbacks=[metrics_callback, memory_callback],
         peft_config=lora_config,
@@ -857,15 +863,23 @@ def main():
 
 
 if __name__ == "__main__":
-    import os, fcntl
+    import os, fcntl, time
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     os.makedirs(OUTPUT_DIR_RL, exist_ok=True)
-    with open(Path(OUTPUT_DIR_RL) / ".preprocess.lock", "w") as lf:
-        if local_rank == 0:
-            fcntl.flock(lf, fcntl.LOCK_EX)   # exclusive: blocks all other ranks
-            preprocess(cladder_prompt=CLADDER_USER_PROMPT, causci_prompt=CAUSCI_USER_PROMPT, output_dir=Path(OUTPUT_DIR_RL))
-            # lock released on context-manager exit
-        else:
-            fcntl.flock(lf, fcntl.LOCK_SH)   # shared: blocks until rank0's LOCK_EX is released
-            # lock released on context-manager exit
+
+    sentinel = Path(OUTPUT_DIR_RL) / ".preprocess.done"
+
+    if local_rank == 0:
+        sentinel.unlink(missing_ok=True)  # clear any stale sentinel from prior run
+        preprocess(
+            cladder_prompt=CLADDER_USER_PROMPT,
+            causci_prompt=CAUSCI_USER_PROMPT,
+            output_dir=Path(OUTPUT_DIR_RL)
+        )
+        sentinel.touch()  # signal to other ranks that preprocessing is done
+    else:
+        # poll until rank0 writes the sentinel
+        while not sentinel.exists():
+            time.sleep(1)
+
     main()
