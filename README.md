@@ -1,175 +1,231 @@
 # Causal Alignment
 
-## What is the task
+## Task
 
-Fine-tune a language model to solve causal inference problems by producing structured, step-by-step reasoning chains. Two benchmarks:
+Fine-tune a language model to solve causal inference problems via structured step-by-step reasoning. Two benchmarks:
 
-- **CLadder** — binary causal queries (yes/no). Covers 10 query types: marginal, correlation, ATE, ETT, NDE, NIE, counterfactual, backdoor adjustment, collider bias, explaining away.
-- **CauSciBench** — continuous causal effect estimation. Covers 9 estimation methods: OLS, IPW, matching, DiD, RDD, IV, frontdoor, GLM, difference-in-means.
+- **CLadder** — binary causal queries (yes/no). 10 query types: marginal, correlation, ATE, ETT, NDE, NIE, counterfactual, backdoor adjustment, collider bias, explaining away.
+- **CauSciBench** — continuous causal effect estimation. 9 methods: OLS, IPW, matching, DiD, RDD, IV, frontdoor, GLM, difference-in-means.
 
-For each problem the model must produce 5 steps: (1) identify causal structure, (2) select query type or method, (3) derive the estimand or estimation spec, (4) implement and compute, (5) report the answer.
+For each problem the model produces 5 steps: (1) identify causal structure, (2) select query type or method, (3) derive the estimand, (4) compute, (5) report the answer.
 
 ---
 
-## Training methods
+## Models
 
-Two training approaches are implemented, each with its own prompt format and output directory.
-
-### RL-based (GRPO)
-
-**Script:** `src/training/train.py`
-
-Uses TRL's `GRPOTrainer` with vLLM in colocate mode for rollout generation. For each prompt, N completions are sampled, scored by a reward function, and the policy is updated via Group Relative Policy Optimization with a KL penalty against the base model.
-
-The model reasons inside a `<think>` block (Qwen3 thinking mode enabled via `enable_thinking=True`) and returns a structured JSON object with all 5 steps. The `<think>\n` prefill is injected into every prompt before generation.
-
-**Reward functions:**
-
-- *CLadder*: cascade scoring — step1 (graph, judge), step2 (query type, exact match), step3 (estimand, judge), step5 (answer, exact match). Wrong graph → −1.0 immediately; wrong query type → −0.5 immediately; wrong estimand applies a −0.25 penalty to the final score.
-- *CauSciBench*: cascade scoring — method (exact match), treatment/outcome (exact match), controls overlap (≥0.75 threshold), effect accuracy (within 5% of reference via estimation library). Wrong method → −1.0 immediately; wrong treatment or outcome → −0.5 immediately.
-- Parse failure (malformed JSON) → −1.0 for both benchmarks.
-
-**Judge:** `Qwen/Qwen2.5-72B-Instruct` served as a local vLLM API on port 8001 (GPU 2-3). Scores step1 and step3 for CLadder (binary 0/1).
-
-Output: `src/output_RL/`
-
-### SFT-based (LoRA fine-tuning)
-
-**Scripts:** `src_finetune/train_sft.py` (single GPU), `src_finetune/train_sft_ddp.py` (multi-GPU DDP)
-
-QLoRA fine-tuning with a custom loss:
-- CE over thinking tokens (steps 1–4 inside `<think>`)
-- λ × CE over the answer token (Yes/No) immediately after `</think>`
-
-The prompt asks the model to reason inside a `<think>` block and output a single word answer.
-
-Output: `src/output_fine_tune_lora/`
-
-### Prompt differences
-
-The two training methods use different prompt templates defined in their respective training scripts. Both are passed to `preprocess()` at startup, which rebuilds the dataset with the correct template for that run.
+- **Policy:** `Qwen/Qwen3-8B` with extended thinking (`enable_thinking=True`)
+- **Judge:** `Qwen/Qwen3-8B` served locally on port 8001 — scores CLadder step1 (graph) and step3 (estimand) as 0/1
 
 ---
 
 ## Hardware
 
-4 × GH200 GPUs (96 GB HBM3 each, 384 GB total).
+4 × GH200 GPUs (96 GB HBM3 each).
 
 | GPUs | Role |
 |------|------|
-| 0–1 | Qwen3-8B policy — TRL training + vLLM rollout (colocate mode) |
-| 2–3 | Qwen2.5-72B-Instruct judge — frozen vLLM inference server |
+| 0–2  | Policy model (training + vLLM rollout) |
+| 3    | Judge server (frozen vLLM/sglang inference) |
 
 ---
 
-## Policy model
+## Training Methods
 
-`Qwen/Qwen3-8B` with thinking mode enabled.
+Three training approaches, each with its own prompt format, output directory, and built-in eval.
 
-Judge for reward scoring: `Qwen/Qwen2.5-72B-Instruct` (RL only, local vLLM server).
+---
+
+### 1. SFT — QLoRA (DDP)
+
+**Script:** `src/training/train_sft_ddp.py`
+**Run:** `sbatch run_sft_script.sh`
+
+QLoRA fine-tuning with a weighted cross-entropy loss:
+- Weight 1.0 on thinking tokens (steps 1–4 inside `<think>`)
+- Weight 5.0 (`ANSWER_LAMBDA`) on the answer token (Yes/No after `</think>`)
+
+**CLadder only** — CauSciBench rows are filtered out during data loading.
+
+Output format: single word `Yes` or `No` after `</think>`.
+
+**Eval during training:** one logit-based accuracy pass on the CLadder test set at the end of training (rank 0 only). No generation — model logits at the answer position are compared directly.
+
+**Outputs:**
+```
+src/output_fine_tune_lora/
+  train.jsonl / test.jsonl     — preprocessed data (SFT prompt format)
+  checkpoints/step_{N}/        — periodic LoRA adapter checkpoints
+  final/                       — final LoRA adapter
+  plots/training_curves.png
+  tokenized_data.pt            — cached tokenized sequences
+```
+
+---
+
+### 2. RL — GRPO via TRL
+
+**Script:** `src/training/train_trl.py`
+**Run:** `sbatch run_rl_script.sh`
+
+GRPO with TRL's `GRPOTrainer`. vLLM runs in colocate mode on GPUs 0–2 for rollout generation (6 completions per prompt). Judge server runs on GPU 3.
+
+The model reasons inside `<think>` and returns a JSON object with all 5 steps. Both CLadder and CauSciBench are trained jointly.
+
+**Reward functions:**
+- *CLadder*: cascade — step1 graph (judge, −1.0 gate) → step2 query type (exact match, −0.5 gate) → step3 estimand (judge, −0.25 penalty) → step5 answer (exact match, ±1.0)
+- *CauSciBench*: cascade — method (exact match, −1.0 gate) → treatment/outcome (exact match, −0.5 gate) → controls overlap (≥0.75) + effect within 5% of reference (±1.0 / 0.5 / −0.25)
+- Parse failure → −1.0 for both
+
+**Eval during training:** reward function runs on the test set every 1000 steps (`evaluation_strategy="steps"`, `eval_steps=1000`). Logged by `MetricsCallback`.
+
+**Outputs:**
+```
+src/output_RL/
+  train.jsonl / test.jsonl     — preprocessed data (TRL prompt format)
+  checkpoints/step_{N}/        — periodic LoRA adapter checkpoints (every 100 steps)
+  checkpoints/final/           — final LoRA adapter
+  plots/
+```
+
+---
+
+### 3. RL — GRPO via veRL (FSDP)
+
+**Script:** `src/training/verl_/data_process.py` (data prep) + `src/training/verl_/reward.py` (reward)
+**Run:** `sbatch run_verl.sh`
+
+Same GRPO algorithm as TRL but using veRL's FSDP backend instead of DDP, which gives higher throughput. Ray cluster on GPUs 0–2, judge server (sglang) on GPU 3.
+
+Data must be converted to Parquet first — `run_verl.sh` calls `data_process.py` automatically before starting training.
+
+**Eval during training:** reward-based validation every 100 steps (`trainer.test_freq=100`) using `compute_score` from `verl_/reward.py`.
+
+**Outputs:**
+```
+src/output_RL/
+  train.parquet / test.parquet — veRL parquet input files
+  verl_checkpoints/            — checkpoints saved every 500 steps
+```
 
 ---
 
 ## Dataset
 
-102,050 synthetic training examples (CLadder + CauSciBench). Test set: original benchmark examples held out entirely.
+| Split | Source | Rows |
+|-------|--------|------|
+| Train | CLadder synthetic + CauSciBench synthetic | ~14K |
+| Test  | CLadder (causal-nlp/CLadder on HF) + CauSciBench original | ~1K |
+
+Raw files: `dataset/train.jsonl`, `dataset/test.jsonl`
+
+Each training script calls `preprocess()` at startup, which rebuilds prompts using that script's own templates and writes `train.jsonl` / `test.jsonl` to the script's output directory. The raw `dataset/` files are never modified.
 
 ---
 
-## Codebase structure
+## Codebase Structure
 
 ```
 src/
-  config.py                    — single source of truth: model names, paths, all hyperparameters
+  config.py                        — all model names, paths, hyperparameters
 
   data/
-    preprocess.py              — rebuild prompts with caller-supplied templates, normalize labels
-                                 called at the start of each training script with that script's prompts
-
-  eval/
-    parser.py                  — extract per-step fields from completions via regex
-    metrics.py                 — per-step scoring + judge calls + aggregate metrics
-    eval.py                    — entry point: load model → generate → parse → score → write results
+    data.py                        — load CLadder (HuggingFace) + CauSciBench (local JSON)
+    preprocess.py                  — rebuild prompts with caller's template, normalize labels
+    build_dataset.py               — one-time pipeline: assemble dataset/ from all sources
+    split_dataset.py               — train/test split
+    synthetic_cladder.py           — generate CLadder synthetic examples
+    synthetic_causci.py            — generate CauSciBench synthetic examples (via OpenAI)
 
   training/
-    train.py                   — GRPO training loop (TRL + vLLM)
-    tool_calling.py            — estimation library: loads CSV, runs the correct estimator
-                                 (OLS, IPW, matching, DiD, RDD, IV, frontdoor, GLM),
-                                 returns float effect estimate for CauSciBench reward scoring
+    train_sft_ddp.py               — SFT QLoRA, multi-GPU DDP
+    train_trl.py                   — GRPO training (TRL + vLLM colocate)
+    tool_calling.py                — causal estimation library: loads CSV, runs OLS/IPW/
+                                     matching/DiD/RDD/IV/frontdoor/GLM, returns effect float
 
-  output_RL/                   — written by train.py
-    train.jsonl / test.jsonl   — preprocessed data (RL prompt format)
-    checkpoints/               — step_N/, epoch_N/, final/
-    plots/
+    verl_/
+      data_process.py              — convert train/test JSONL to Parquet for veRL
+      reward.py                    — reward function + extraction logic (veRL interface)
 
-src_finetune/
-  train_sft.py                 — SFT QLoRA, single GPU
-  train_sft_ddp.py             — SFT QLoRA, multi-GPU DDP
-
-  output_fine_tune_lora/       — written by train_sft*.py
-    train.jsonl / test.jsonl   — preprocessed data (SFT prompt format)
-    checkpoints/
-    plots/
+  eval/
+    eval_sft.py                    — post-training eval for SFT (generation + step5 accuracy)
+    eval_rl.py                     — post-training eval for TRL/veRL (stub)
 
 dataset/
-  train.jsonl                  — raw synthetic training examples
-  test.jsonl                   — raw original benchmark examples
+  train.jsonl                      — raw synthetic training examples
+  test.jsonl                       — raw original benchmark examples (held out)
+  synthetic_causci/                — 450 generated CauSciBench CSV files
+
+original_data/
+  CauSciBench/                     — source benchmark data + causci_bench package
+  Cladder/                         — CLadder RandomBuilder (synthetic generation)
+
+logs/                              — SLURM job logs
+run_sft_script.sh                  — SLURM: SFT training (4 GPUs, DDP)
+run_rl_script.sh                   — SLURM: TRL GRPO training (judge on GPU 3, policy on 0–2)
+run_verl.sh                        — SLURM: veRL GRPO training (judge sglang on GPU 3, Ray on 0–2)
 ```
 
 ---
 
-## How to run
+## How to Run
 
-### RL training (GRPO)
+All three scripts expect the cluster environment with the appropriate venv activated. Edit the `source` and `cd` lines in the SLURM scripts to match your paths before submitting.
 
-**Step 1 — Launch the judge server on GPU 2-3:**
-
-```bash
-CUDA_VISIBLE_DEVICES=2,3 vllm serve Qwen/Qwen2.5-72B-Instruct \
-    --port 8001 \
-    --tensor-parallel-size 2 \
-    --gpu-memory-utilization 0.85 \
-    --dtype bfloat16
-```
-
-**Step 2 — Once the server is ready, start training on GPU 0-1:**
+### SFT
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 src/training/train.py
+sbatch run_sft_script.sh
 ```
 
-This runs preprocessing with the RL prompt first, then starts GRPO training. Everything is configured in `src/config.py`.
+Runs `torchrun --nproc_per_node=4 src/training/train_sft_ddp.py` across all 4 GPUs.
+Preprocessing (SFT prompt format) runs on rank 0 before training starts.
 
-**Or submit as a SLURM job (handles both steps automatically):**
+Final model → `src/output_fine_tune_lora/final/`
+Eval metric → CLadder test accuracy (logit-based), printed at end of training.
+
+### TRL GRPO
 
 ```bash
 sbatch run_rl_script.sh
 ```
 
-Checkpoints saved every `SAVE_EVERY` steps and at end of each epoch. Final weights: `src/output_RL/checkpoints/final/`.
+Starts judge server on GPU 3, waits for it to be healthy, then runs:
+`torchrun --nproc_per_node=3 src/training/train_trl.py` on GPUs 0–2.
 
-### SFT training — single GPU
+Preprocessing (TRL prompt format) runs on rank 0 before training starts.
+
+Final model → `src/output_RL/checkpoints/final/`
+Eval metric → mean reward on test set, logged every 1000 steps.
+
+### veRL GRPO
 
 ```bash
-python src_finetune/train_sft.py
+sbatch run_verl.sh
 ```
 
-### SFT training — multi-GPU DDP
+1. Runs `data_process.py` to convert JSONL → Parquet (includes preprocessing with veRL prompts)
+2. Starts judge server (sglang) on GPU 3
+3. Starts Ray cluster on GPUs 0–2
+4. Runs `verl.trainer.main_ppo` with GRPO config
 
-```bash
-torchrun --nproc_per_node=NUM_GPUS src_finetune/train_sft_ddp.py
-```
-
-Both SFT scripts run preprocessing with the SFT prompt before training. Final weights: `src/output_fine_tune_lora/final/`.
+Checkpoints → `src/output_RL/verl_checkpoints/`
+Eval metric → mean reward on validation parquet, logged every 100 steps.
 
 ---
 
-## How to evaluate
+## Configuration
 
-```bash
-python src/eval/eval.py
-```
+All hyperparameters and paths are in `src/config.py`. Change them there and every script picks them up.
 
-Loads from `src/output_RL/checkpoints/final` (set via `FINAL_MODEL` in `src/config.py`). Runs greedy generation over the test set, scores each row, writes results to `src/output_RL/eval/`.
+Key settings:
 
-Output: `results.jsonl` (per-row) and `metrics.json` (aggregated), plus a summary table broken down by query type (CLadder) and method (CauSciBench).
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `POLICY_MODEL` | `Qwen/Qwen3-8B` | Base model |
+| `JUDGE_MODEL` | `Qwen/Qwen3-8B` | Judge for CLadder scoring |
+| `N_ROLLOUTS` | 6 | Completions per prompt (RL) |
+| `TRAIN_BATCH_SIZE` | 2 | Prompts per training step |
+| `LORA_R` | 16 | LoRA rank (RL); 32 for SFT |
+| `BETA` | 0.01 | KL penalty coefficient |
+| `LR` | 2e-5 | Learning rate |
+| `EVAL_MAX_TOKENS` | 4096 | Max tokens during eval generation |
