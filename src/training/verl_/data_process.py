@@ -1,0 +1,244 @@
+import json
+import pandas as pd
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3] # verl_ -> training -> src -> project root
+sys.path.insert(0, str(PROJECT_ROOT)) # allow imports from project root
+
+from src.data.preprocess import preprocess
+from src.config import (
+    OUTPUT_DIR_RL,
+)
+
+# ---------------------------------------------------------------------------
+CLADDER_USER_PROMPT = """
+## Query Types
+
+| Type | Formula | Use when |
+|------|---------|----------|
+| marginal | P(Y=y) | Baseline probability of an outcome, no conditions or interventions |
+| correlation | P(Y=y\\|X=x) | Observing X changes probability of Y, no intervention |
+| ate | E[Y\\|do(X=1)] - E[Y\\|do(X=0)] | Forcing X to a value — what is the causal effect on Y |
+| backadj | Does set S block all backdoor paths X→Y? | Question asks whether adjusting for a variable set is valid |
+| det-counterfactual | P(Y_x=y \\| evidence) | What would Y have been if X were different, given observed facts |
+| ett | E[Y₁-Y₀ \\| X=1] | Among those who received treatment, what if they hadn't |
+| nde | E[Y_{1,M₀} - Y_{0,M₀}] | Direct effect of X on Y, holding mediator at its natural value |
+| nie | E[Y_{0,M₁} - Y_{0,M₀}] | Indirect effect of X on Y, only through the mediator |
+| collider_bias | Does do(X) affect Y when Z is a collider? | X and Y share only a common effect, no common cause |
+| exp_away | Does P(Y\\|X) change when conditioning on collider Z? | Conditioning on a common effect creates spurious association |
+
+## Estimation Rules
+
+- **ate — backdoor (confounders exist)**: Σ_z P(Z=z) [P(Y=1|X=1,Z=z) - P(Y=1|X=0,Z=z)]
+- **ate — frontdoor (mediator, confounded treatment)**: Σ_m P(M=m|X=1) Σ_x P(X=x) P(Y=1|M=m,X=x) — same with X=0, subtract
+- **ate — instrumental variable (instrument V2 exists)**: [P(Y=1|V2=1) - P(Y=1|V2=0)] / [P(X=1|V2=1) - P(X=1|V2=0)]
+- **ett**: Σ_z P(Z=z|X=1) [P(Y=1|X=1,Z=z) - P(Y=1|X=0,Z=z)]
+- **det-counterfactual**: (1) Abduction — infer U from evidence, (2) Action — set X=x, (3) Prediction — compute P(Y)
+- **nde**: Σ_m P(M=m|X=0) [P(Y=1|X=1,M=m) - P(Y=1|X=0,M=m)]
+- **nie**: Σ_m [P(M=m|X=1) - P(M=m|X=0)] P(Y=1|X=0,M=m)
+- **backadj / collider_bias / exp_away**: graph analysis only — trace paths, check d-separation, no arithmetic
+
+## Answer Interpretation
+
+- **ate / ett / nde / nie**: compute the value. Positive → treatment increases outcome. Negative → decreases. Match to what the question asks.
+- **marginal**: compare P(Y=1) to threshold or what the question asks.
+- **correlation**: compare P(Y=1|X=1) vs P(Y=1|X=0).
+- **det-counterfactual**: compare computed probability to prior or threshold.
+- **backadj / collider_bias / exp_away**: yes or no from graph structure alone.
+
+## Scenario
+
+{verbalized_story}
+
+## Task
+
+Step 1 — Causal Structure: Assign short variable names (X, Y, Z, M, V1, V2, ...) to each entity in the scenario. List every directed edge as A -> B.
+
+Step 2 — Query Type: Classify as exactly one type from the table above. One word only.
+
+Step 3 — Estimand: Write the mathematical expression for the query. Apply backdoor / frontdoor / IV / abduction-action-prediction as needed. No numbers yet.
+
+Step 4 — Compute: Substitute every numeric value from the scenario into the estimand. Show each arithmetic step explicitly. End with the final number. For backadj / collider_bias / exp_away, trace the graph paths and state your conclusion.
+
+Then output this JSON and nothing else:
+
+{{
+  "step1": "<variable assignments and all directed edges>",
+  "step2": "<query type>",
+  "step3": "<estimand expression>",
+  "step4": "<full arithmetic or graph reasoning, final value at the end>",
+  "step5": "<yes or no>"
+}}
+"""
+
+CAUSCI_USER_PROMPT = """
+## Study Description
+{dataset_description}
+
+## Dataset
+Path: {file_path}
+Shape: {shape}
+
+Columns and types:
+{columns_and_types}
+
+First 5 rows:
+{df_head}
+
+Summary statistics:
+{df_describe}
+
+Missing values per column:
+{missing_values}
+
+Low-cardinality columns (≤10 unique values):
+{low_cardinality}
+
+## Question
+{query}
+
+---
+
+## Method Reference
+
+| Method | Use when |
+|--------|----------|
+| diff_in_means | RCT with enforced compliance. Groups comparable by design. No confounding. |
+| ols | Observational. All confounders observed and included. No unobserved confounding. |
+| ipw | Observational. Confounders observed. Reweight by propensity score. Needs overlap: 0 < e(X) < 1. |
+| matching | Observational. Confounders observed. Use when propensity score overlap is poor. |
+| did | Panel data. Treatment introduced at one point in time to one group. Time variable must be treatment timing, not a covariate. Parallel trends must hold. |
+| rdd | Treatment assigned by a running variable crossing a known cutoff. Units just above and below cutoff are comparable. |
+| iv | Unobserved confounders exist. Valid instrument available — correlated with treatment, affects outcome only through treatment. |
+| frontdoor | Unobserved confounders exist. Full mediator pathway T→M→Y with no unobserved T→M or M→Y confounding. |
+| glm | Binary outcome (logistic) or count outcome (Poisson). Confounders observed. |
+
+## Estimand Reference
+
+| Method | Estimand |
+|--------|----------|
+| diff_in_means | ATE |
+| ols | ATE |
+| ipw | ATE, ATT, or ATC — based on whether question asks about population, treated group, or control group |
+| matching | ATE or ATT |
+| did | ATT |
+| rdd | Local ATE at the cutoff |
+| iv | LATE |
+| frontdoor | ATE |
+| glm | Conditional effect (log-odds for binary, incidence rate ratio for counts) |
+
+---
+
+Think through the following before answering:
+- Was treatment randomly assigned or self-selected?
+- Are confounders observed or unobserved?
+- Is there a time variable marking treatment timing (not just a covariate)?
+- Is there a continuous running variable with a cutoff?
+- Is there a variable that affects treatment but not outcome directly?
+- Is the outcome binary, count, or continuous?
+- Does the question ask about the full population (ATE), treated units (ATT), or local effect (LATE)?
+
+Then output this JSON and nothing else after your thinking:
+
+{{
+  "step1": {{
+    "treatment": "<exact column name>",
+    "outcome": "<exact column name>",
+    "controls": ["<col1>", "<col2>"],
+    "instrument": null,
+    "running_variable": null,
+    "cutoff": null,
+    "time_variable": null,
+    "group_variable": null,
+    "mediator": null,
+    "estimand": "<ATE, ATT, ATC, LATE, or conditional>"
+  }},
+  "step2": "<method name>"
+}}
+"""
+
+
+# Add these imports at top
+
+CAUSCI_SYSTEM_PROMPT = """You are a causal inference expert. Analyze the study design carefully 
+before selecting variables and methods. Think through your reasoning, 
+then output only the JSON.
+"""
+
+CLADDER_SYSTEM_PROMPT = """You are a causal inference expert. Think step by step inside <think> tags, 
+then output a JSON object and no other text. No explanations, no leading or tailing sentences. Just answer with the JSON object. 
+"""
+
+def _build_messages(row: dict) -> list[dict]:
+    system = CLADDER_SYSTEM_PROMPT if row["source"] == "cladder" else CAUSCI_SYSTEM_PROMPT
+    return [
+        {"role": "system",    "content": system},
+        {"role": "user",      "content": row["prompt"]},
+        {"role": "assistant", "content": "<think>"},
+    ]
+
+def _resolve_csv_path(stored: str) -> str:
+    """Re-anchor stored csv_path to current PROJECT_ROOT via known anchor segments."""
+    p = Path(stored)
+    for anchor in ("dataset", "original_data"):
+        for i, part in enumerate(p.parts):
+            if part == anchor:
+                return str(PROJECT_ROOT / Path(*p.parts[i:]))
+    raise ValueError(f"Cannot resolve csv_path — no anchor found: {stored}")
+
+def _build_extra_info(row: dict) -> dict:
+    if row["source"] == "cladder":
+        return {"csv_path": "", "dataset_columns": []}
+
+    stored = row.get("csv_path")
+    if not stored:
+        p = row["prompt"]
+        path_start = p.find("Path: ") + len("Path: ")
+        stored = p[path_start : p.find("\n", path_start)].strip()
+
+    csv_path = _resolve_csv_path(stored)
+    dataset_columns = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    return {"csv_path": csv_path, "dataset_columns": dataset_columns}
+
+def _convert_split(jsonl_path: Path, parquet_path: Path) -> None:
+    if not jsonl_path.exists():
+        raise FileNotFoundError(f"JSONL not found: {jsonl_path}. Run preprocess() first.")
+ 
+    records = []
+    skipped = 0
+ 
+    with open(jsonl_path) as f:
+        for line in f:
+            row = json.loads(line)
+            try:
+                records.append({
+                    "prompt":       _build_messages(row),          # was: row["prompt"]
+                    "data_source":  row["source"],                 # was: "source"
+                    "reward_model": json.dumps(                    # was: "ground_truth"
+                        {"ground_truth": row["groundtruth"]}
+                    ),
+                    "extra_info":   json.dumps(_build_extra_info(row)),  # serialize — same issue as before
+                })
+            except Exception as e:
+                # print(f"  SKIP {row.get('id', '?')}: {e}")
+                raise FileNotFoundError(f"Error processing row with id {row.get('id', '?')}: {e}")
+ 
+    df = pd.DataFrame(records)
+    df.to_parquet(parquet_path, index=False)
+    print(f"  {len(records)} rows written → {parquet_path}  (skipped: {skipped})")
+
+def main():
+    # preprocess raw data into train/test jsonl files for RL training
+    output_dir = Path(OUTPUT_DIR_RL)
+    preprocess(cladder_prompt=CLADDER_USER_PROMPT, causci_prompt=CAUSCI_USER_PROMPT, output_dir=output_dir)
+    print("Preprocessing complete.")
+
+    print("Preparing veRL parquet files...")
+    _convert_split(output_dir / "train.jsonl", output_dir / "train.parquet")
+    _convert_split(output_dir / "test.jsonl",  output_dir / "test.parquet")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

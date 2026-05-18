@@ -14,7 +14,7 @@
 uenv image pull pytorch/v2.9.1:v2
 uenv start pytorch/v2.9.1:v2 --view=default
 
-source /iopsstor/scratch/cscs/ajannali/venv/cai/bin/activate
+source /iopsstor/scratch/cscs/ajannali/venv/cai_trl/bin/activate
 cd /iopsstor/scratch/cscs/ajannali/project/causal_alignment
 
 # Verify vllm is available before trying to background it
@@ -30,7 +30,7 @@ echo "Starting judge server..."
 CUDA_VISIBLE_DEVICES=3 vllm serve Qwen/Qwen3-8B \
     --port 8001 \
     --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.85 \
+    --gpu-memory-utilization 0.35 \
     --dtype bfloat16 > judge_server.log 2>&1 &
 
 JUDGE_PID=$!
@@ -43,14 +43,12 @@ until [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8001/health)"
     if ! kill -0 "$JUDGE_PID" 2>/dev/null; then
         echo "ERROR: Judge server process died. Last lines of judge_server.log:" >&2
         tail -20 judge_server.log >&2
-        exit 1
     fi
     COUNT=$((COUNT + 1))
     if [ "$COUNT" -ge "$TIMEOUT" ]; then
         echo "ERROR: Judge server did not become ready after $((TIMEOUT * 5))s." >&2
         tail -20 judge_server.log >&2
         kill "$JUDGE_PID" 2>/dev/null
-        exit 1
     fi
     echo "  waiting... (${COUNT}/${TIMEOUT})"
     sleep 5

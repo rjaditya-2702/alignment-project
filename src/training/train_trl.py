@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT)) # allow imports from project root
 
 def _resolve_csv_path(stored: str) -> str:
     """Re-anchor a stored csv_path to the current PROJECT_ROOT.
@@ -20,6 +20,7 @@ def _resolve_csv_path(stored: str) -> str:
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 from functools import lru_cache
 # from openai import AsyncOpenAI
 from openai import OpenAI
@@ -156,45 +157,45 @@ training_args = GRPOConfig(
     # --- core ---
     output_dir=OUTPUT_DIR,
     num_train_epochs=1,
-    per_device_train_batch_size=TRAIN_BATCH_SIZE,     # prompts per GPU per step
+    per_device_train_batch_size=TRAIN_BATCH_SIZE,
     gradient_accumulation_steps=1,
+    use_liger_kernel=True,
+    gradient_checkpointing=False,
 
     # --- GRPO-specific ---
-    num_generations=N_ROLLOUTS,                 # N rollouts per prompt (the group size)
-    max_completion_length=TRAIN_MAX_TOKENS,   # 1024
-    # max_prompt_length=MAX_PROMPT_LEN,         # 3072 
+    num_generations=N_ROLLOUTS,
+    max_completion_length=TRAIN_MAX_TOKENS,
 
     # --- KL penalty ---
-    beta=0.04,                         # weight on KL(π_θ ∥ π_ref); 0 disables it
+    beta=0.04,
 
     # --- vLLM ---
     use_vllm=True,
-    vllm_mode="colocate",              # shares GPUs with training; use "server"
-                                       # if you have dedicated inference GPUs
-    vllm_gpu_memory_utilization=0.5,   # leave headroom for training weights
+    vllm_mode="colocate",
+    # vllm_enable_sleep_mode=True,          # was False — this is the fix
+    vllm_gpu_memory_utilization=0.4,        # was 0.25 — safe now that sleep releases during training
+    # vllm_enable_prefix_caching=True,      # add this — 8 rollouts share the same prompt prefix
+    vllm_max_model_length=4096,
 
     # --- logging / saving ---
     logging_steps=10,
     save_steps=100,
-    report_to="none",                  # swap to "wandb" or "tensorboard"
+    report_to="none",
 
-    # --- generation ---
-    # generation_kwargs={"enable_thinking": True},
+    # --- model loading --- only attn_implementation here, dtype handled above
+    model_init_kwargs={
+        "attn_implementation": "flash_attention_3",
+        "dtype": "bfloat16"
+    },
 
     # --- misc ---
     bf16=True,
     seed=42,
     dataloader_pin_memory=True,
     dataloader_num_workers=4,
+    dataloader_persistent_workers=True,
+    shuffle_dataset=True
 )
-
-# ---------------------------------------------------------------------------
-# JUDGE  (Qwen2.5-72B-Instruct on GPU 2-3, served via vLLM on port 8001)
-# Launch separately before training:
-#   CUDA_VISIBLE_DEVICES=2,3 vllm serve Qwen/Qwen2.5-72B-Instruct \
-#       --port 8001 --tensor-parallel-size 2 \
-#       --gpu-memory-utilization 0.85 --dtype bfloat16
-# ---------------------------------------------------------------------------
 
 # _async_judge = AsyncOpenAI(base_url="http://localhost:8001/v1", api_key="token")
 
