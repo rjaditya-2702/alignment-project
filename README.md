@@ -113,8 +113,8 @@ src/output_RL/
 
 | Split | Source | Rows |
 |-------|--------|------|
-| Train | CLadder synthetic + CauSciBench synthetic | ~14K |
-| Test  | CLadder (causal-nlp/CLadder on HF) + CauSciBench original | ~1K |
+| Train | CLadder synthetic + CauSciBench synthetic | ~87K |
+| Test  | CLadder (causal-nlp/CLadder on HF) + CauSciBench original | ~9K |
 
 Raw files: `dataset/train.jsonl`, `dataset/test.jsonl`
 
@@ -145,10 +145,6 @@ src/
     verl_/
       data_process.py              — convert train/test JSONL to Parquet for veRL
       reward.py                    — reward function + extraction logic (veRL interface)
-
-  eval/
-    eval_sft.py                    — post-training eval for SFT (generation + step5 accuracy)
-    eval_rl.py                     — post-training eval for TRL/veRL (stub)
 
 dataset/
   train.jsonl                      — raw synthetic training examples
@@ -210,6 +206,23 @@ sbatch run_verl.sh
 
 Checkpoints → `src/output_RL/verl_checkpoints/`
 Eval metric → mean reward on validation parquet, logged every 100 steps.
+
+---
+
+## Tests
+
+```bash
+python -m pytest tests/test_reward_extraction.py -v
+```
+
+76 tests, no GPU or network required — all ML deps are stubbed with `unittest.mock`.
+
+| Suite | Modules tested | What's covered |
+|-------|---------------|----------------|
+| `TestExtractCladder` | TRL, veRL | Clean JSON, `</think>` stripping, trailing-comma recovery, missing fields, unknown query type, invalid step5, case normalisation, all 10 query types |
+| `TestExtractCausci` | TRL, SFT, veRL | OLS, `</think>`, unknown method, treatment/outcome not in columns, control filtering, IV / RDD / DiD / frontdoor validation |
+| `TestTRLRewardFn` | TRL | Perfect score, wrong estimand penalty (−0.25), wrong answer, wrong step1/step2 early-exit, unparseable output, CauSciBench correct/wrong, mixed batch |
+| `TestVeRLRewardFn` | veRL | Same reward paths via veRL's `(solution_strs, ground_truths, extra_infos)` interface |
 
 ---
 

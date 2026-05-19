@@ -201,29 +201,62 @@ def _build_extra_info(row: dict) -> dict:
     dataset_columns = pd.read_csv(csv_path, nrows=0).columns.tolist()
     return {"csv_path": csv_path, "dataset_columns": dataset_columns}
 
-def _convert_split(jsonl_path: Path, parquet_path: Path) -> None:
+CLADDER_TRAIN_LIMIT = 10_000  # set to None to use full dataset
+
+
+def _limit_cladder(rows: list[dict], limit: int) -> list[dict]:
+    cladder = [r for r in rows if r["source"] == "cladder"]
+    other   = [r for r in rows if r["source"] != "cladder"]
+
+    # step 1: count unique (query_type, formal_form, polarity) buckets
+    bucket_counts: dict[tuple, int] = {}
+    for r in cladder:
+        gt  = r.get("groundtruth") or {}
+        key = (gt.get("step2") or "", gt.get("step3") or "", str(r.get("label", "")))
+        bucket_counts[key] = bucket_counts.get(key, 0) + 1
+
+    n_per_bucket = limit // len(bucket_counts)
+
+    # step 2: stream with per-bucket counters
+    counters: dict[tuple, int] = {}
+    kept = []
+    for r in cladder:
+        gt  = r.get("groundtruth") or {}
+        key = (gt.get("step2") or "", gt.get("step3") or "", str(r.get("label", "")))
+        cnt = counters.get(key, 0)
+        if cnt < n_per_bucket:
+            kept.append(r)
+            counters[key] = cnt + 1
+
+    print(f"CLadder limit: {len(cladder)} → {len(kept)} "
+          f"({len(bucket_counts)} buckets × {n_per_bucket}, target={limit})")
+    return kept + other
+
+
+def _convert_split(jsonl_path: Path, parquet_path: Path, limit: int | None = None) -> None:
     if not jsonl_path.exists():
         raise FileNotFoundError(f"JSONL not found: {jsonl_path}. Run preprocess() first.")
- 
+
+    with open(jsonl_path) as f:
+        rows = [json.loads(line) for line in f]
+
+    if limit is not None:
+        rows = _limit_cladder(rows, limit)
+
     records = []
     skipped = 0
- 
-    with open(jsonl_path) as f:
-        for line in f:
-            row = json.loads(line)
-            try:
-                records.append({
-                    "prompt":       _build_messages(row),          # was: row["prompt"]
-                    "data_source":  row["source"],                 # was: "source"
-                    "reward_model": json.dumps(                    # was: "ground_truth"
-                        {"ground_truth": row["groundtruth"]}
-                    ),
-                    "extra_info":   json.dumps(_build_extra_info(row)),  # serialize — same issue as before
-                })
-            except Exception as e:
-                # print(f"  SKIP {row.get('id', '?')}: {e}")
-                raise FileNotFoundError(f"Error processing row with id {row.get('id', '?')}: {e}")
- 
+
+    for row in rows:
+        try:
+            records.append({
+                "prompt":       _build_messages(row),
+                "data_source":  row["source"],
+                "reward_model": json.dumps({"ground_truth": row["groundtruth"]}),
+                "extra_info":   json.dumps(_build_extra_info(row)),
+            })
+        except Exception as e:
+            raise FileNotFoundError(f"Error processing row with id {row.get('id', '?')}: {e}")
+
     df = pd.DataFrame(records)
     df.to_parquet(parquet_path, index=False)
     print(f"  {len(records)} rows written → {parquet_path}  (skipped: {skipped})")
@@ -235,7 +268,7 @@ def main():
     print("Preprocessing complete.")
 
     print("Preparing veRL parquet files...")
-    _convert_split(output_dir / "train.jsonl", output_dir / "train.parquet")
+    _convert_split(output_dir / "train.jsonl", output_dir / "train.parquet", limit=CLADDER_TRAIN_LIMIT)
     _convert_split(output_dir / "test.jsonl",  output_dir / "test.parquet")
     print("Done.")
 

@@ -420,6 +420,38 @@ Then output this JSON and nothing else after your thinking:
 }}
 """
 
+CLADDER_TRAIN_LIMIT = 10_000  # set to None to use full dataset
+
+
+def _limit_cladder(rows: list[dict], limit: int) -> list[dict]:
+    cladder = [r for r in rows if r["source"] == "cladder"]
+    other   = [r for r in rows if r["source"] != "cladder"]
+
+    # step 1: count unique (query_type, formal_form, polarity) buckets
+    bucket_counts: dict[tuple, int] = {}
+    for r in cladder:
+        gt  = r.get("groundtruth") or {}
+        key = (gt.get("step2") or "", gt.get("step3") or "", str(r.get("label", "")))
+        bucket_counts[key] = bucket_counts.get(key, 0) + 1
+
+    n_per_bucket = limit // len(bucket_counts)
+
+    # step 2: stream with per-bucket counters
+    counters: dict[tuple, int] = {}
+    kept = []
+    for r in cladder:
+        gt  = r.get("groundtruth") or {}
+        key = (gt.get("step2") or "", gt.get("step3") or "", str(r.get("label", "")))
+        cnt = counters.get(key, 0)
+        if cnt < n_per_bucket:
+            kept.append(r)
+            counters[key] = cnt + 1
+
+    print(f"CLadder limit: {len(cladder)} → {len(kept)} "
+          f"({len(bucket_counts)} buckets × {n_per_bucket}, target={limit})")
+    return kept + other
+
+
 def load_dataset_for_grpo(path) -> Dataset:
     """
     Load preprocessed JSONL and return a HuggingFace Dataset.
@@ -432,6 +464,9 @@ def load_dataset_for_grpo(path) -> Dataset:
     """
     with open(path, "r") as f:
         raw = [json.loads(line) for line in f]
+
+    if CLADDER_TRAIN_LIMIT is not None and str(path).endswith("train.jsonl"):
+        raw = _limit_cladder(raw, CLADDER_TRAIN_LIMIT)
 
     new_data = []
     for r in raw:

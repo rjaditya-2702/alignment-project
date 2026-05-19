@@ -13,7 +13,8 @@ Output: output/train.jsonl
 
 import json
 import os
-from collections import Counter
+import random
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np

@@ -240,7 +240,7 @@ for d in [SFT_LORA_OUTPUT_DIR, SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR]:
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 POLICY_MODEL       = "Qwen/Qwen3-8B"
-MAX_PROMPT_LEN     = 4096
+MAX_PROMPT_LEN     = 6000
 TRAIN_MAX_TOKENS   = 1200
 LR                 = 2e-5
 WEIGHT_DECAY       = 0.01
@@ -443,6 +443,7 @@ def build_sequence(prompt: str, thinking: str, answer: str, source: str = "cladd
     messages = [
         {"role": "system", "content": system},
         {"role": "user",   "content": prompt},
+        {"role": "assistant", "content": "<think>"}
     ]
 
     prompt_text = tokenizer.apply_chat_template(
