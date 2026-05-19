@@ -89,7 +89,7 @@ src/output_RL/
 
 ---
 
-### 3. RL — GRPO via veRL (FSDP)
+### 3. RL — GRPO via veRL (FSDP - InProgress)
 
 **Script:** `src/training/verl_/data_process.py` (data prep) + `src/training/verl_/reward.py` (reward)
 **Run:** `sbatch run_verl.sh`
