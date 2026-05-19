@@ -11,7 +11,7 @@
 #SBATCH --view=default
 #SBATCH --time=06:00:00
 
-uenv image pull pytorch/v2.9.1:v2
+# uenv image pull pytorch/v2.9.1:v2
 uenv start pytorch/v2.9.1:v2 --view=default
 
 source /iopsstor/scratch/cscs/ajannali/venv/cai_trl/bin/activate

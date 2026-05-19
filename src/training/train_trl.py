@@ -7,15 +7,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT)) # allow imports from project root
 
 def _resolve_csv_path(stored: str) -> str:
-    """Re-anchor a stored csv_path to the current PROJECT_ROOT.
-    Finds 'dataset/' in the stored path and rebuilds from there,
-    so the path works across clusters regardless of where preprocess ran.
-    """
+    """Re-anchor stored csv_path to current PROJECT_ROOT via known anchor segments."""
     p = Path(stored)
-    for i, part in enumerate(p.parts):
-        if part == "dataset":
-            return str(PROJECT_ROOT / Path(*p.parts[i:]))
-    raise ValueError(f"Cannot resolve csv_path — no 'dataset' anchor found: {stored}")
+    for anchor in ("dataset", "original_data"):
+        for i, part in enumerate(p.parts):
+            if part == anchor:
+                return str(PROJECT_ROOT / Path(*p.parts[i:]))
+    raise ValueError(f"Cannot resolve csv_path — no anchor found: {stored}")
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -173,7 +171,7 @@ training_args = GRPOConfig(
     use_vllm=True,
     vllm_mode="colocate",
     # vllm_enable_sleep_mode=True,          # was False — this is the fix
-    vllm_gpu_memory_utilization=0.4,        # was 0.25 — safe now that sleep releases during training
+    vllm_gpu_memory_utilization=0.5,        # was 0.25 — safe now that sleep releases during training
     # vllm_enable_prefix_caching=True,      # add this — 8 rollouts share the same prompt prefix
     vllm_max_model_length=4096,
 
@@ -197,7 +195,7 @@ training_args = GRPOConfig(
     shuffle_dataset=True,
 
     # --- evaluation during training ---
-    evaluation_strategy="steps",
+    eval_strategy="steps",
     eval_steps=1000,
 )
 
@@ -241,6 +239,7 @@ training_args = GRPOConfig(
 
 _judge_client = OpenAI(base_url="http://localhost:8001/v1", api_key="token")
 
+@lru_cache(maxsize=512)
 def _judge_one(prompt: str) -> float:
     try:
         r = _judge_client.chat.completions.create(

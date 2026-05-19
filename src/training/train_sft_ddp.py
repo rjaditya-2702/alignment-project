@@ -1,14 +1,21 @@
 """
-SFT QLoRA Training — Qwen3-8B on CLaDDer
-Loss: CE over thinking tokens + λ * CE over answer token
+SFT QLoRA Training — Qwen3-8B on CLaDDer + CauSciBench
+Loss: CE over thinking tokens + λ * CE over answer token (cladder)
+      CE over all response tokens (causcibench)
 """
 import sys
 import os
+import re
 import json
+import time
 import torch
 import torch.nn.functional as F
+import pandas as pd
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -30,6 +37,7 @@ from src.config import (TRAIN_DATA_SFT_LORA as TRAIN_DATA,
                         SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR,
                         TRAIN_BATCH_SIZE)
 from src.data.preprocess import preprocess
+from src.training.tool_calling import library_fn
 
 CLADDER_PROMPT = """You are given a scenario describing relationships between variables, along with numerical data and a question. Your task is to determine the answer by following these steps precisely.
 ---
@@ -131,6 +139,102 @@ IMPORTANT: After writing answer with a single word, STOP. No more text is allowe
 Respond now. Begin directly with <think>
 """
 
+CAUSCI_SYSTEM_PROMPT = """You are a causal inference expert. Analyze the study design carefully
+before selecting variables and methods. Think through your reasoning,
+then output only the JSON.
+"""
+
+CAUSCI_USER_PROMPT = """
+## Study Description
+{dataset_description}
+
+## Dataset
+Path: {file_path}
+Shape: {shape}
+
+Columns and types:
+{columns_and_types}
+
+First 5 rows:
+{df_head}
+
+Summary statistics:
+{df_describe}
+
+Missing values per column:
+{missing_values}
+
+Low-cardinality columns (≤10 unique values):
+{low_cardinality}
+
+## Question
+{query}
+
+---
+
+## Method Reference
+
+| Method | Use when |
+|--------|----------|
+| diff_in_means | RCT with enforced compliance. Groups comparable by design. No confounding. |
+| ols | Observational. All confounders observed and included. No unobserved confounding. |
+| ipw | Observational. Confounders observed. Reweight by propensity score. Needs overlap: 0 < e(X) < 1. |
+| matching | Observational. Confounders observed. Use when propensity score overlap is poor. |
+| did | Panel data. Treatment introduced at one point in time to one group. Time variable must be treatment timing, not a covariate. Parallel trends must hold. |
+| rdd | Treatment assigned by a running variable crossing a known cutoff. Units just above and below cutoff are comparable. |
+| iv | Unobserved confounders exist. Valid instrument available — correlated with treatment, affects outcome only through treatment. |
+| frontdoor | Unobserved confounders exist. Full mediator pathway T→M→Y with no unobserved T→M or M→Y confounding. |
+| glm | Binary outcome (logistic) or count outcome (Poisson). Confounders observed. |
+
+## Estimand Reference
+
+| Method | Estimand |
+|--------|----------|
+| diff_in_means | ATE |
+| ols | ATE |
+| ipw | ATE, ATT, or ATC — based on whether question asks about population, treated group, or control group |
+| matching | ATE or ATT |
+| did | ATT |
+| rdd | Local ATE at the cutoff |
+| iv | LATE |
+| frontdoor | ATE |
+| glm | Conditional effect (log-odds for binary, incidence rate ratio for counts) |
+
+---
+
+Think through the following before answering:
+- Was treatment randomly assigned or self-selected?
+- Are confounders observed or unobserved?
+- Is there a time variable marking treatment timing (not just a covariate)?
+- Is there a continuous running variable with a cutoff?
+- Is there a variable that affects treatment but not outcome directly?
+- Is the outcome binary, count, or continuous?
+- Does the question ask about the full population (ATE), treated units (ATT), or local effect (LATE)?
+
+Then output this JSON and nothing else after your thinking:
+
+{{
+  "step1": {{
+    "treatment": "<exact column name>",
+    "outcome": "<exact column name>",
+    "controls": ["<col1>", "<col2>"],
+    "instrument": null,
+    "running_variable": null,
+    "cutoff": null,
+    "time_variable": null,
+    "group_variable": null,
+    "mediator": null,
+    "estimand": "<ATE, ATT, ATC, LATE, or conditional>"
+  }},
+  "step2": "<method name>"
+}}
+"""
+
+CAUSCI_METHODS = {
+    'diff_in_means', 'ols', 'ipw', 'matching',
+    'did', 'rdd', 'iv', 'frontdoor', 'glm'
+}
+
 for d in [SFT_LORA_OUTPUT_DIR, SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -162,24 +266,185 @@ IM_END_ID       = tokenizer.convert_tokens_to_ids("<|im_end|>")
 THINK_CLOSE_ID  = tokenizer.convert_tokens_to_ids("</think>")
 
 
+# ── CSV path resolution ────────────────────────────────────────────────────────
+def _resolve_csv_path(stored: str) -> str:
+    p = Path(stored)
+    for anchor in ("dataset", "original_data"):
+        for i, part in enumerate(p.parts):
+            if part == anchor:
+                return str(PROJECT_ROOT / Path(*p.parts[i:]))
+    raise ValueError(f"Cannot resolve csv_path — no anchor found: {stored}")
+
+
+# ── CausCI scoring ─────────────────────────────────────────────────────────────
+
+def extract_json(model_output: str) -> dict | None:
+    if '</think>' in model_output:
+        model_output = model_output.split('</think>')[-1]
+
+    start = model_output.find('{')
+    end   = model_output.rfind('}')
+
+    if start == -1 or end == -1:
+        return None
+
+    json_str = model_output[start:end+1]
+
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        json_str = re.sub(r',\s*}', '}', json_str)
+        json_str = re.sub(r',\s*]', ']', json_str)
+        try:
+            return json.loads(json_str)
+        except:
+            return None
+
+
+def extract_causci(model_output: str, dataset_columns: list[str]) -> dict | None:
+    parsed = extract_json(model_output)
+
+    if parsed is None:
+        return None
+
+    if 'step1' not in parsed or 'step2' not in parsed:
+        return None
+
+    step1  = parsed['step1']
+    method = parsed.get('step2', '').strip().lower()
+
+    if method not in CAUSCI_METHODS:
+        return None
+
+    treatment = step1.get('treatment', '').strip()
+    outcome   = step1.get('outcome', '').strip()
+
+    if treatment not in dataset_columns:
+        return None
+    if outcome not in dataset_columns:
+        return None
+
+    controls = step1.get('controls', [])
+    controls = [c for c in controls if c in dataset_columns]
+
+    if method == 'iv':
+        instrument = step1.get('instrument')
+        if instrument not in dataset_columns:
+            return None
+
+    if method == 'rdd':
+        running_var = step1.get('running_variable')
+        cutoff      = step1.get('cutoff')
+        if running_var not in dataset_columns:
+            return None
+        if cutoff is None:
+            return None
+
+    if method == 'did':
+        time_var  = step1.get('time_variable')
+        group_var = step1.get('group_variable')
+        if time_var not in dataset_columns:
+            return None
+        if group_var not in dataset_columns:
+            return None
+
+    if method == 'frontdoor':
+        mediator = step1.get('mediator')
+        if mediator not in dataset_columns:
+            return None
+
+    return {
+        'step1': {
+            'treatment':        treatment,
+            'outcome':          outcome,
+            'controls':         controls,
+            'instrument':       step1.get('instrument'),
+            'running_variable': step1.get('running_variable'),
+            'cutoff':           step1.get('cutoff'),
+            'time_variable':    step1.get('time_variable'),
+            'group_variable':   step1.get('group_variable'),
+            'mediator':         step1.get('mediator'),
+            'estimand':         step1.get('estimand', '').strip().lower(),
+        },
+        'step2': method,
+    }
+
+
+def reward_causci(prediction: dict, ground_truth: dict, library_effect: float) -> tuple[float, dict]:
+    scores = {}
+
+    pred_method = prediction.get('step2', '').strip().lower()
+    ref_method  = ground_truth.get('step2', '').strip().lower()
+    scores['method'] = 1 if pred_method == ref_method else 0
+
+    if scores['method'] == 0:
+        return -1.0, scores
+
+    pred_treat = prediction.get('step1', {}).get('treatment', '').strip()
+    ref_treat  = ground_truth.get('step1', {}).get('treatment', '').strip()
+    scores['treatment'] = 1 if pred_treat == ref_treat else 0
+
+    pred_outcome = prediction.get('step1', {}).get('outcome', '').strip()
+    ref_outcome  = ground_truth.get('step1', {}).get('outcome', '').strip()
+    scores['outcome'] = 1 if pred_outcome == ref_outcome else 0
+
+    if scores['treatment'] == 0 or scores['outcome'] == 0:
+        return -0.5, scores
+
+    pred_controls = set(prediction.get('step1', {}).get('controls', []))
+    ref_controls  = set(ground_truth.get('step1', {}).get('controls', []))
+    if len(ref_controls) > 0:
+        scores['controls'] = len(pred_controls & ref_controls) / len(ref_controls)
+    else:
+        scores['controls'] = 1.0 if len(pred_controls) == 0 else 0.0
+
+    controls_good = scores['controls'] >= 0.75
+
+    ref_effect = ground_truth.get('step5')
+    if ref_effect is not None and ref_effect != 0:
+        mre = abs(library_effect - ref_effect) / abs(ref_effect)
+        effect_correct = mre <= 0.05
+    else:
+        effect_correct = False
+
+    scores['effect'] = 1 if effect_correct else 0
+
+    if controls_good and effect_correct:
+        reward = 1.0
+    elif not controls_good and effect_correct:
+        reward = 0.5
+    elif controls_good and not effect_correct:
+        reward = -0.25
+    else:
+        reward = -0.25
+
+    return reward, scores
+
+
 # ── Build Full Sequence ────────────────────────────────────────────────────────
-def build_sequence(prompt: str, thinking: str, answer: str) -> dict:
+def build_sequence(prompt: str, thinking: str, answer: str, source: str = "cladder") -> dict:
     """
     Constructs the full token sequence for one training sample.
 
-    Layout:
+    cladder layout:
         [prompt tokens] [<think>\n thinking \n</think>\n] [answer] [<|im_end|>\n]
+        loss_mask: 1.0 for thinking, ANSWER_LAMBDA for answer token
 
-    Returns:
-        input_ids  : (L,)   full token sequence
-        loss_mask  : (L,)   0=ignore, 1=thinking CE, LAMBDA=answer CE
+    causcibench layout:
+        [prompt tokens] [<think>\n\n</think>] [answer_json] [<|im_end|>\n]
+        loss_mask: 1.0 for all response tokens
     """
-    messages = [
-        {"role": "system","content": "You are a causal reasoning expert and a helpful assistant. Don't explain. just do the task"},
-        {"role": "user", "content": prompt}]
+    system = (
+        "You are a causal reasoning expert and a helpful assistant. Don't explain. just do the task"
+        if source == "cladder"
+        else CAUSCI_SYSTEM_PROMPT
+    )
 
-    # apply_chat_template with enable_thinking=True ends with:
-    # <|im_start|>assistant\n<think>\n
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": prompt},
+    ]
+
     prompt_text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -187,12 +452,9 @@ def build_sequence(prompt: str, thinking: str, answer: str) -> dict:
         enable_thinking=True,
     )
 
-    # Full target: thinking content + closing tags + answer + end token
-    # The prompt_text already opens <think>, so we continue from there
     response_text = thinking + "\n</think>" + answer + "<|im_end|>\n"
     full_text     = prompt_text + response_text
 
-    # Tokenize full sequence (no truncation yet — we handle it below)
     full_ids = tokenizer(
         full_text,
         return_tensors="pt",
@@ -209,7 +471,6 @@ def build_sequence(prompt: str, thinking: str, answer: str) -> dict:
 
     prompt_len = len(prompt_ids)
 
-    # Truncate if over budget
     max_len = MAX_PROMPT_LEN + TRAIN_MAX_TOKENS
     if len(full_ids) > max_len:
         full_ids = full_ids[:max_len]
@@ -217,35 +478,30 @@ def build_sequence(prompt: str, thinking: str, answer: str) -> dict:
     seq_len   = len(full_ids)
     loss_mask = torch.zeros(seq_len, dtype=DTYPE)
 
-    # Find </think> position in the full sequence
-    think_close_pos = None
-    for i in range(prompt_len, seq_len):
-        if full_ids[i].item() == THINK_CLOSE_ID:
-            think_close_pos = i
-            break
+    if source == "cladder":
+        think_close_pos = None
+        for i in range(prompt_len, seq_len):
+            if full_ids[i].item() == THINK_CLOSE_ID:
+                think_close_pos = i
+                break
 
-    if think_close_pos is not None:
-        # Thinking tokens: prompt_len → think_close_pos (inclusive of </think>)
-        loss_mask[prompt_len : think_close_pos + 1] = 1.0
-        # Answer token: immediately after </think>
-        answer_pos = think_close_pos + 1
-        if answer_pos < seq_len:
-            loss_mask[answer_pos] = ANSWER_LAMBDA
+        if think_close_pos is not None:
+            loss_mask[prompt_len : think_close_pos + 1] = 1.0
+            answer_pos = think_close_pos + 1
+            if answer_pos < seq_len:
+                loss_mask[answer_pos] = ANSWER_LAMBDA
+        else:
+            loss_mask[prompt_len:] = 1.0
     else:
-        # Fallback: CE on everything after prompt
+        # causcibench: CE on all response tokens uniformly
         loss_mask[prompt_len:] = 1.0
 
-    return {"input_ids": full_ids, "loss_mask": loss_mask}
+    return {"input_ids": full_ids, "loss_mask": loss_mask, "prompt_len": prompt_len}
 
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
-class CladderDataset(Dataset):
+class SFTDataset(Dataset):
     def __init__(self, samples: list[dict]):
-        """
-        Each sample dict must have:
-            "input_ids"  : torch.LongTensor  (L,)
-            "loss_mask"  : torch.FloatTensor (L,)
-        """
         self.samples = samples
 
     def __len__(self):
@@ -268,9 +524,14 @@ def collate_fn(batch: list[dict]) -> dict:
 
     attention_mask = (input_ids != tokenizer.pad_token_id).long()
     return {
-        "input_ids":      input_ids,
-        "attention_mask": attention_mask,
-        "loss_mask":      loss_masks,
+        "input_ids":         input_ids,
+        "attention_mask":    attention_mask,
+        "loss_mask":         loss_masks,
+        "prompt_lens":       [s.get("prompt_len", 0) for s in batch],
+        "source":            [s.get("source", "cladder") for s in batch],
+        "groundtruth":       [s.get("groundtruth", {}) for s in batch],
+        "csv_path":          [s.get("csv_path", "") for s in batch],
+        "dataset_columns":   [s.get("dataset_columns", []) for s in batch],
     }
 
 
@@ -279,22 +540,20 @@ def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor, loss_mask: torch
     """
     logits    : (B, L, V)
     input_ids : (B, L)
-    loss_mask : (B, L)  — 0=ignore, 1=thinking, LAMBDA=answer
+    loss_mask : (B, L)  — 0=ignore, 1=thinking/response, LAMBDA=answer (cladder only)
 
     Shift by 1: logits[t] predicts input_ids[t+1]
     """
-    shift_logits = logits[:, :-1, :].contiguous()           # (B, L-1, V)
-    shift_labels = input_ids[:, 1:].contiguous()             # (B, L-1)
-    shift_mask   = loss_mask[:, 1:].contiguous()             # (B, L-1)
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    shift_mask   = loss_mask[:, 1:].contiguous()
 
-    # Per-token CE, no reduction
     per_token_loss = F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
         shift_labels.view(-1),
         reduction="none",
-    ).view(shift_labels.shape)                               # (B, L-1)
+    ).view(shift_labels.shape)
 
-    # Apply mask (0 = no gradient, 1 = full CE, LAMBDA = upweighted)
     weighted_loss = (per_token_loss * shift_mask).sum()
     denom         = (shift_mask > 0).float().sum().clamp(min=1)
     return weighted_loss / denom
@@ -308,32 +567,64 @@ def format_groundtruth(gt: dict) -> str:
         if f"step{i}" in gt
     )
 
-TOKENIZED_CACHE = SFT_LORA_OUTPUT_DIR / "tokenized_data.pt"
+TOKENIZED_CACHE = SFT_LORA_OUTPUT_DIR / "tokenized_data_v2.pt"
 
-def load_and_tokenize_cladder() -> tuple[CladderDataset, CladderDataset]:
+def load_and_tokenize() -> tuple[SFTDataset, SFTDataset]:
     if not os.path.exists(TOKENIZED_CACHE):
         train_samples, test_samples = [], []
         for path, bucket in tqdm([(TRAIN_DATA, train_samples), (TEST_DATA, test_samples)]):
             with open(path, "r") as f:
                 for line in tqdm(f):
-                    item = json.loads(line)
-                    # REMOVE LATER #################
-                    if item["source"] != "cladder":#
-                        continue                   #
-                    ################################
-                    seq = build_sequence(
-                        prompt   = item["prompt"],
-                        thinking = format_groundtruth(item["groundtruth"]),
-                        answer   = item["label"],
-                    )
-                    train_samples.append(seq) if path == TRAIN_DATA else test_samples.append(seq)
-        print(f"Train: {len(train_samples)} | Test: {len(test_samples)} CLaDDer samples.")
+                    item   = json.loads(line)
+                    source = item["source"]
+                    gt     = item["groundtruth"]
+
+                    if source == "cladder":
+                        seq = build_sequence(
+                            prompt   = item["prompt"],
+                            thinking = format_groundtruth(gt),
+                            answer   = item["label"],
+                            source   = "cladder",
+                        )
+                        seq["source"]          = "cladder"
+                        seq["groundtruth"]     = gt
+                        seq["csv_path"]        = ""
+                        seq["dataset_columns"] = []
+
+                    else:  # causcibench
+                        answer_json = json.dumps({"step1": gt["step1"], "step2": gt["step2"]})
+                        seq = build_sequence(
+                            prompt   = item["prompt"],
+                            thinking = "",
+                            answer   = answer_json,
+                            source   = "causcibench",
+                        )
+                        seq["source"]      = "causcibench"
+                        seq["groundtruth"] = gt
+
+                        raw_csv = item.get("csv_path", "")
+                        csv_path = _resolve_csv_path(raw_csv) if raw_csv else ""
+                        seq["csv_path"]        = csv_path
+                        seq["dataset_columns"] = (
+                            pd.read_csv(csv_path, nrows=0).columns.tolist()
+                            if csv_path else []
+                        )
+
+                    bucket.append(seq)
+
+        n_train_cl = sum(1 for s in train_samples if s["source"] == "cladder")
+        n_train_cs = sum(1 for s in train_samples if s["source"] == "causcibench")
+        n_test_cl  = sum(1 for s in test_samples  if s["source"] == "cladder")
+        n_test_cs  = sum(1 for s in test_samples  if s["source"] == "causcibench")
+        print(f"Train: {n_train_cl} cladder  {n_train_cs} causcibench")
+        print(f"Test:  {n_test_cl} cladder  {n_test_cs} causcibench")
+
         tmp = str(TOKENIZED_CACHE) + f".{os.getpid()}.tmp"
         torch.save({"train": train_samples, "test": test_samples}, tmp)
-        os.replace(tmp, TOKENIZED_CACHE)  # atomic — identical content across ranks, last writer wins
+        os.replace(tmp, TOKENIZED_CACHE)
 
     saved = torch.load(TOKENIZED_CACHE, weights_only=False, map_location="cpu")
-    return CladderDataset(saved["train"]), CladderDataset(saved["test"])
+    return SFTDataset(saved["train"]), SFTDataset(saved["test"])
 
 # ── Optimizer ──────────────────────────────────────────────────────────────────
 def build_optimizer(model) -> AdamW:
@@ -343,46 +634,91 @@ def build_optimizer(model) -> AdamW:
         weight_decay=WEIGHT_DECAY,
     )
 
-# -- Evalluate ------------------------------------------------------------------
+# -- Evaluate ------------------------------------------------------------------
 def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) -> float:
     torch.cuda.empty_cache()
     torch.cuda.set_device(device)
     ddp_model.eval()
-    correct, total = 0, 0
+
+    cladder_correct, cladder_total = 0, 0
+    causci_rewards = []
+
     yes_id = tokenizer.convert_tokens_to_ids("Yes")
     no_id  = tokenizer.convert_tokens_to_ids("No")
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            input_ids      = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            loss_mask      = batch["loss_mask"][0]
+            source = batch["source"][0]
 
-            # Find answer token position (where loss_mask == ANSWER_LAMBDA)
-            answer_positions = (loss_mask == ANSWER_LAMBDA).nonzero(as_tuple=True)[0]
-            if len(answer_positions) == 0:
-                continue
-            answer_pos = answer_positions[0].item()
+            if source == "cladder":
+                input_ids      = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                loss_mask      = batch["loss_mask"][0]
 
-            with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-                outputs = ddp_model.module(input_ids=input_ids, attention_mask=attention_mask)
+                answer_positions = (loss_mask == ANSWER_LAMBDA).nonzero(as_tuple=True)[0]
+                if len(answer_positions) == 0:
+                    continue
+                answer_pos = answer_positions[0].item()
 
-            # logits at answer_pos - 1 predicts the token at answer_pos
-            answer_logits = outputs.logits[0, answer_pos - 1, :]
-            pred_id       = answer_logits[[yes_id, no_id]].argmax().item()
-            pred_label    = "Yes" if pred_id == 0 else "No"
-            true_label    = tokenizer.decode(input_ids[0, answer_pos]).strip()
+                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+                    outputs = ddp_model.module(input_ids=input_ids, attention_mask=attention_mask)
 
-            if pred_label.lower() == true_label.lower():
-                correct += 1
-            total += 1
+                answer_logits = outputs.logits[0, answer_pos - 1, :]
+                pred_id       = answer_logits[[yes_id, no_id]].argmax().item()
+                pred_label    = "Yes" if pred_id == 0 else "No"
+                true_label    = tokenizer.decode(input_ids[0, answer_pos]).strip()
 
-    accuracy = correct / total if total > 0 else 0.0
-    print(f"Test Accuracy: {correct}/{total} = {accuracy:.4f}")
+                if pred_label.lower() == true_label.lower():
+                    cladder_correct += 1
+                cladder_total += 1
+
+            else:  # causcibench — generate then call library
+                prompt_len      = batch["prompt_lens"][0]
+                csv_path        = batch["csv_path"][0]
+                dataset_columns = batch["dataset_columns"][0]
+                gt              = batch["groundtruth"][0]
+
+                input_ids      = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+
+                # batch_size=1 in test loader, no padding — prompt is the first prompt_len tokens
+                prompt_ids  = input_ids[:, :prompt_len]
+                prompt_attn = attention_mask[:, :prompt_len]
+
+                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+                    generated = ddp_model.module.generate(
+                        input_ids=prompt_ids,
+                        attention_mask=prompt_attn,
+                        max_new_tokens=512,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+
+                new_tokens  = generated[0, prompt_len:]
+                output_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+                parsed = extract_causci(output_text, dataset_columns)
+                if parsed is None:
+                    causci_rewards.append(-1.0)
+                    continue
+
+                # attach csv_path so library_fn can load the data
+                parsed["step1"]["csv_path"] = csv_path
+
+                effect = library_fn(parsed)
+                reward, _ = reward_causci(parsed, gt, effect)
+                causci_rewards.append(reward)
+
+    cladder_acc   = cladder_correct / cladder_total if cladder_total > 0 else 0.0
+    causci_reward = sum(causci_rewards) / len(causci_rewards) if causci_rewards else 0.0
+
+    print(f"CLaDDer Accuracy:        {cladder_correct}/{cladder_total} = {cladder_acc:.4f}")
+    print(f"CauSciBench Avg Reward:  {causci_reward:.4f} ({len(causci_rewards)} samples)")
+
     ddp_model.train()
-    return accuracy
+    return cladder_acc
 
-import traceback 
+import traceback
 
 # ── Training Loop ──────────────────────────────────────────────────────────────
 def train(train_dataset, test_dataset):
@@ -466,7 +802,7 @@ def train(train_dataset, test_dataset):
                     loss    = compute_loss(outputs.logits, input_ids, loss_mask)
                     loss    = loss / GRAD_ACCUM
 
-                # Compute train accuracy before backward (logits freed after backward)
+                # Train accuracy — only for cladder samples (those with ANSWER_LAMBDA token)
                 with torch.no_grad():
                     for i in range(input_ids.shape[0]):
                         ans_pos_list = (loss_mask[i] == ANSWER_LAMBDA).nonzero(as_tuple=True)[0]
@@ -507,7 +843,7 @@ def train(train_dataset, test_dataset):
                         ckpt_path = SFT_LORA_CHECKPOINT_DIR / f"step_{global_step}"
                         ddp_model.module.save_pretrained(ckpt_path)
                         tokenizer.save_pretrained(ckpt_path)
-                        print(f"Checkpoint saved → {ckpt_path} | train_loss={train_loss_avg:.4f} train_acc={train_acc:.4f}")
+                        print(f"Checkpoint saved → {ckpt_path} | train_loss={train_loss_avg:.4f} cladder_train_acc={train_acc:.4f}")
 
             if local_rank == 0:
                 print(f"Epoch {epoch+1} complete. Avg loss: {epoch_loss / len(train_dataloader):.4f}")
@@ -522,25 +858,40 @@ def train(train_dataset, test_dataset):
 
         if local_rank == 0:
             test_acc = evaluate(ddp_model, test_dataloader, device)
-            print(f"Final test accuracy: {test_acc:.4f}")
+            print(f"Final CLaDDer test accuracy: {test_acc:.4f}")
 
             if metric_steps:
                 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-                axes[0].plot(metric_steps, metric_train_loss); axes[0].set_title("Train Loss");     axes[0].set_xlabel("Step")
-                axes[1].plot(metric_steps, metric_train_acc);  axes[1].set_title("Train Accuracy"); axes[1].set_xlabel("Step")
-                fig.suptitle(f"Final Test Accuracy: {test_acc:.4f}")
+                axes[0].plot(metric_steps, metric_train_loss); axes[0].set_title("Train Loss");           axes[0].set_xlabel("Step")
+                axes[1].plot(metric_steps, metric_train_acc);  axes[1].set_title("CLaDDer Train Acc");   axes[1].set_xlabel("Step")
+                fig.suptitle(f"Final CLaDDer Test Accuracy: {test_acc:.4f}")
                 fig.tight_layout()
                 plot_path = SFT_LORA_PLOT_DIR / "training_curves.png"
                 fig.savefig(plot_path, dpi=100)
                 plt.close(fig)
                 print(f"Plots saved → {plot_path}")
     except Exception as e:
-        print(f"rank {local_rank} CRACHED: {e}", flush = True)
+        print(f"rank {local_rank} CRASHED: {e}", flush=True)
         traceback.print_exc()
         dist.destroy_process_group()
         raise
+
 if __name__ == "__main__":
-    # preprocess(cladder_prompt=CLADDER_PROMPT, causci_prompt="CAUSCI_PROMPT {dataset_description} {file_path} {shape} {columns_and_types} {df_head} {df_describe} {missin_values} {low_cardinality} {query}", output_dir=SFT_LORA_OUTPUT_DIR)
-    train_dataset, test_dataset = load_and_tokenize_cladder()
-    
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    sentinel = SFT_LORA_OUTPUT_DIR / ".preprocess.done"
+
+    if local_rank == 0:
+        sentinel.unlink(missing_ok=True)
+        preprocess(
+            cladder_prompt=CLADDER_PROMPT,
+            causci_prompt=CAUSCI_USER_PROMPT,
+            output_dir=SFT_LORA_OUTPUT_DIR,
+        )
+        sentinel.touch()
+    else:
+        while not sentinel.exists():
+            time.sleep(1)
+
+    train_dataset, test_dataset = load_and_tokenize()
     train(train_dataset, test_dataset)
