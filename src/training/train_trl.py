@@ -1,7 +1,9 @@
+import os
 import re
 import json
 import sys
 from pathlib import Path
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT)) # allow imports from project root
@@ -15,6 +17,8 @@ def _resolve_csv_path(stored: str) -> str:
                 return str(PROJECT_ROOT / Path(*p.parts[i:]))
     raise ValueError(f"Cannot resolve csv_path — no anchor found: {stored}")
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
@@ -30,7 +34,7 @@ from peft import LoraConfig, TaskType
 
 from src.data.preprocess import preprocess
 from src.config import (
-    POLICY_MODEL as MODEL_NAME, 
+    POLICY_MODEL as MODEL_NAME,
     OUTPUT_DIR_RL,
     CHECKPOINT_DIR as OUTPUT_DIR,
     JUDGE_MODEL,
@@ -40,95 +44,92 @@ from src.config import (
     N_ROLLOUTS,
     FINAL_MODEL,
     TRAIN_MAX_TOKENS,
-    MAX_PROMPT_LEN
+    MAX_PROMPT_LEN,
+    PLOT_DIR,
 )
 from src.training.tool_calling import library_fn
+from src.training.eval_metrics import compute_eval_metrics, save_eval_plots
 
 # ---------------------------------------------------------------------------
-# CALLBACK: collect metrics during training
+# CALLBACKS
 # ---------------------------------------------------------------------------
 
-class MetricsCallback(TrainerCallback):
-    def __init__(self):
-        self.train_losses  = []
-        self.train_rewards = []
-        self.eval_rewards  = []
-        self.steps         = []
-        self.eval_steps    = []
+EVAL_EVERY = 100   # steps between test-set evaluations
+EVAL_N_CLADDER = 100
+EVAL_N_CAUSCI  = 50
 
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        """Fires every `logging_steps` during training."""
-        if logs is None:
+class EvalCallback(TrainerCallback):
+    def __init__(self, test_dataset, tokenizer, plot_dir):
+        self.test_dataset = test_dataset
+        self.tokenizer    = tokenizer
+        self.plot_dir     = Path(plot_dir)
+        self.eval_steps   = []
+        self.history      = {}
+
+    def on_step_end(self, args, state, control, **kwargs):
+
+        print("Performing evaluation...")
+
+        if state.global_step % EVAL_EVERY != 0:
             return
-        step = state.global_step
-
-        if "loss" in logs:
-            self.steps.append(step)
-            self.train_losses.append(logs["loss"])
-
-        # TRL's GRPOTrainer logs reward as "reward" or "train/reward"
-        reward_key = next(
-            (k for k in ("reward", "train/reward", "rewards/mean") if k in logs),
-            None
-        )
-        if reward_key:
-            self.train_rewards.append(logs[reward_key])
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        """Fires after each evaluation run."""
-        if metrics is None:
+        if int(os.environ.get("LOCAL_RANK", 0)) != 0:
             return
-        step = state.global_step
 
-        reward_key = next(
-            (k for k in ("eval_reward", "eval/reward", "eval_rewards/mean") if k in metrics),
-            None
-        )
-        if reward_key:
-            self.eval_steps.append(step)
-            self.eval_rewards.append(metrics[reward_key])
+        model = kwargs.get("model")
+        if model is None:
+            return
 
-    # ------------------------------------------------------------------
-    # Plotting
-    # ------------------------------------------------------------------
-    def plot(self, save_path="training_progress.png"):
-        has_eval = len(self.eval_rewards) > 0
-        n_plots  = 2 + int(has_eval)          # loss | train reward | (eval reward)
+        ds = self.test_dataset
+        cladder_idxs = [i for i, s in enumerate(ds["source"]) if s == "cladder"][:EVAL_N_CLADDER]
+        causci_idxs  = [i for i, s in enumerate(ds["source"]) if s == "causcibench"][:EVAL_N_CAUSCI]
 
-        fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 4))
-        fig.suptitle("GRPO Training Progress", fontsize=14, fontweight="bold")
+        model.eval()
+        items    = []
+        first_out = None
+        for idx in tqdm(cladder_idxs + causci_idxs):
+            row      = ds[idx]
+            src      = row["source"]
+            gt       = json.loads(row["groundtruth"])
+            cols     = row["dataset_columns"]
+            csv_path = row["csv_path"]
 
-        # --- training loss ---
-        ax = axes[0]
-        ax.plot(self.steps, self.train_losses, color="steelblue", linewidth=1.5)
-        ax.set_title("Training Loss")
-        ax.set_xlabel("Step")
-        ax.set_ylabel("Loss")
-        ax.grid(True, alpha=0.3)
+            input_ids = self.tokenizer.apply_chat_template(
+                row["prompt"], tokenize=True, add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(model.device)
 
-        # --- training reward ---
-        ax = axes[1]
-        ax.plot(self.steps[:len(self.train_rewards)],
-                self.train_rewards, color="seagreen", linewidth=1.5)
-        ax.set_title("Training Reward")
-        ax.set_xlabel("Step")
-        ax.set_ylabel("Reward")
-        ax.grid(True, alpha=0.3)
+            with torch.no_grad():
+                gen_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=512,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+            out = self.tokenizer.decode(gen_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+            if first_out is None:
+                first_out = out
+            parsed = extract_cladder(out) if src == "cladder" else extract_causci(out, cols)
+            items.append((src, parsed, gt, csv_path))
 
-        # --- eval reward (optional) ---
-        if has_eval:
-            ax = axes[2]
-            ax.plot(self.eval_steps, self.eval_rewards,
-                    color="darkorange", linewidth=1.5, marker="o", markersize=4)
-            ax.set_title("Eval Reward")
-            ax.set_xlabel("Step")
-            ax.set_ylabel("Reward")
-            ax.grid(True, alpha=0.3)
+        model.train()
 
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.show()
-        print(f"Plot saved to {save_path}")
+        step    = state.global_step
+        metrics = compute_eval_metrics(items)
+        self.eval_steps.append(step)
+        for k, v in metrics.items():
+            self.history.setdefault(k, []).append(v)
+
+        print(f"\n[eval step {step}]")
+        if first_out is not None:
+            print(f"  sample response: {first_out}")
+        for k, v in sorted(metrics.items()):
+            print(f"  {k}: {v:.4f}")
+
+        self.plot_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.plot_dir / "eval_log.jsonl", "a") as f:
+            f.write(json.dumps({"step": step, **metrics}) + "\n")
+
+        save_eval_plots(self.history, self.eval_steps, self.plot_dir)
 
 class MemoryCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
@@ -171,7 +172,7 @@ training_args = GRPOConfig(
     use_vllm=True,
     vllm_mode="colocate",
     # vllm_enable_sleep_mode=True,          # was False — this is the fix
-    vllm_gpu_memory_utilization=0.5,        # was 0.25 — safe now that sleep releases during training
+    vllm_gpu_memory_utilization=0.3,        # was 0.25 — safe now that sleep releases during training
     # vllm_enable_prefix_caching=True,      # add this — 8 rollouts share the same prompt prefix
     vllm_max_model_length=4096,
 
@@ -246,6 +247,7 @@ def _judge_one(prompt: str) -> float:
             model=JUDGE_MODEL,
             max_tokens=2,
             temperature=0.0,
+            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
             messages=[
                 {"role": "system", "content": "You are a binary scorer. Reply with only 0 or 1. No other text."},
                 {"role": "user",   "content": prompt},
@@ -626,8 +628,27 @@ def reward_cladder_precomputed(prediction: dict, ground_truth: dict, s1_score: i
     return reward, scores
 
 @lru_cache(maxsize=512)
-def cached_library_fn(csv_path, method, treatment, outcome, controls_tuple):
-    return library_fn(csv_path, method, treatment, outcome, controls_tuple)
+def cached_library_fn(
+    csv_path, method, treatment, outcome, controls_tuple,
+    estimand=None, instrument=None, running_variable=None,
+    cutoff=None, time_variable=None, group_variable=None, mediator=None,
+):
+    return library_fn({
+        "step1": {
+            "csv_path":         csv_path,
+            "treatment":        treatment,
+            "outcome":          outcome,
+            "controls":         list(controls_tuple),
+            "estimand":         estimand,
+            "instrument":       instrument,
+            "running_variable": running_variable,
+            "cutoff":           cutoff,
+            "time_variable":    time_variable,
+            "group_variable":   group_variable,
+            "mediator":         mediator,
+        },
+        "step2": method,
+    })
 
 def reward_fn(completions: list, **kwargs) -> list[float]:
     sources      = kwargs["source"]
@@ -679,14 +700,21 @@ def reward_fn(completions: list, **kwargs) -> list[float]:
             if parsed is None:
                 rewards.append(-1.0)
                 continue
-            step1 = parsed["step1"]
+            step1          = parsed["step1"]
             library_effect = cached_library_fn(
-                csv_path,
-                parsed["step2"],
-                step1["treatment"],
-                step1["outcome"],
-                tuple(step1["controls"]),
-            )
+                csv_path                  = csv_path,
+                method                    = parsed["step2"],
+                treatment                 = step1["treatment"],
+                outcome                   = step1["outcome"],
+                controls_tuple            = tuple(step1["controls"]),
+                estimand                  = step1.get("estimand"),
+                instrument                = step1.get("instrument"),
+                running_variable          = step1.get("running_variable"),
+                cutoff                    = step1.get("cutoff"),
+                time_variable             = step1.get("time_variable"),
+                group_variable            = step1.get("group_variable"),
+                mediator                  = step1.get("mediator"),
+            ) if parsed["step2"] == gt.get("step2") else 0.0
             reward, _ = reward_causci(parsed, gt, library_effect)
 
         else:
@@ -870,34 +898,31 @@ def main():
     # dummy = ["<answer>42</answer>"] * training_args.num_generations
     # print("Reward sanity check:", reward_fn(dummy))
 
-    metrics_callback = MetricsCallback()
-    memory_callback  = MemoryCallback()
+    eval_callback   = EvalCallback(test_dataset, tokenizer, PLOT_DIR)
+    memory_callback = MemoryCallback()
 
     # --- trainer ---
     trainer = GRPOTrainer(
         model=MODEL_NAME,
         args=training_args,
-        reward_funcs=reward_fn,        # can also be a list for multiple signals
+        reward_funcs=reward_fn,
         train_dataset=dataset,
-        eval_dataset=test_dataset,          # optional — can be a different dataset or None
+        eval_dataset=test_dataset,
         processing_class=tokenizer,
-        callbacks=[metrics_callback, memory_callback],
+        callbacks=[eval_callback, memory_callback],
         peft_config=lora_config,
     )
 
     trainer.train()
 
-    # plot + save after training
-    metrics_callback.plot(save_path=f"{FINAL_MODEL}/training_progress.png")
-
     # save final model after training to FINAL_MODEL
     trainer.save_model(FINAL_MODEL)
-    tokenizer.save_pretrained(FINAL_MODEL)   
+    tokenizer.save_pretrained(FINAL_MODEL)
     print(f"Model saved to {FINAL_MODEL}")
 
 
 if __name__ == "__main__":
-    import os, fcntl, time
+    import fcntl, time
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     os.makedirs(OUTPUT_DIR_RL, exist_ok=True)
 

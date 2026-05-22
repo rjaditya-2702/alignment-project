@@ -10,8 +10,14 @@ import logging.config
 
 from causci_bench.synthetic.utils import export_info
 
-Path("logs/records").mkdir(parents=True, exist_ok=True)
-logging.config.fileConfig('logs/log_config.ini')
+_CAUSCI_ROOT = Path(__file__).resolve().parents[3]
+_LOG_DIR     = _CAUSCI_ROOT / "logs"
+_LOG_CONFIG  = _LOG_DIR / "log_config.ini"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+(_LOG_DIR / "records").mkdir(parents=True, exist_ok=True)
+if not _LOG_CONFIG.exists():
+    raise FileNotFoundError(f"Logging config not found: {_LOG_CONFIG}")
+logging.config.fileConfig(str(_LOG_CONFIG))
 
 def config_hyperparameters(base_seed, base_mean, base_cov_diag, max_cont, max_bin, n_obs,
                            max_obs, min_obs, max_treat=2, max_periods=5, cutoff_max=25):

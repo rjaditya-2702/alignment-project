@@ -195,12 +195,13 @@ def run_did(df, treatment, outcome, time_variable, group_variable, controls=None
         df = df.set_index(["unit_id", "time_id"])
 
         exog_cols = [treatment] + (controls or [])
-        exog = sm.add_constant(df[exog_cols])
+        exog = df[exog_cols]
         model = PanelOLS(
             df[outcome],
             exog,
             entity_effects=True,
             time_effects=True,
+            check_rank=False,
         ).fit(cov_type="clustered", cluster_entity=True)
         coef = float(model.params[treatment])
         se   = float(model.std_errors[treatment])

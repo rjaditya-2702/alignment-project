@@ -251,8 +251,8 @@ def _convert_split(jsonl_path: Path, parquet_path: Path, limit: int | None = Non
             records.append({
                 "prompt":       _build_messages(row),
                 "data_source":  row["source"],
-                "reward_model": json.dumps({"ground_truth": row["groundtruth"]}),
-                "extra_info":   json.dumps(_build_extra_info(row)),
+                "reward_model": {"ground_truth": json.dumps(row["groundtruth"])},
+                "extra_info":   _build_extra_info(row),
             })
         except Exception as e:
             raise FileNotFoundError(f"Error processing row with id {row.get('id', '?')}: {e}")

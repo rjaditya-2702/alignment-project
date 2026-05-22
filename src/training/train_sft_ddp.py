@@ -38,6 +38,7 @@ from src.config import (TRAIN_DATA_SFT_LORA as TRAIN_DATA,
                         TRAIN_BATCH_SIZE)
 from src.data.preprocess import preprocess
 from src.training.tool_calling import library_fn
+from src.training.eval_metrics import RUNG_MAP, save_eval_plots
 
 CLADDER_PROMPT = """You are given a scenario describing relationships between variables, along with numerical data and a question. Your task is to determine the answer by following these steps precisely.
 ---
@@ -426,13 +427,13 @@ def build_sequence(prompt: str, thinking: str, answer: str, source: str = "cladd
     """
     Constructs the full token sequence for one training sample.
 
-    cladder layout:
-        [prompt tokens] [<think>\n thinking \n</think>\n] [answer] [<|im_end|>\n]
-        loss_mask: 1.0 for thinking, ANSWER_LAMBDA for answer token
+    Both sources:
+        [prompt tokens] [<think> ... thinking ... </think>] [response] [<|im_end|>\n]
 
-    causcibench layout:
-        [prompt tokens] [<think>\n\n</think>] [answer_json] [<|im_end|>\n]
-        loss_mask: 1.0 for all response tokens
+    Loss is applied ONLY to the response after </think> — thinking tokens carry zero loss:
+        cladder:     ANSWER_LAMBDA on the single answer token (yes/no)
+        causcibench: 1.0 on all JSON response tokens
+    If </think> is not found the sample is excluded from loss (mask stays all-zero).
     """
     system = (
         "You are a causal reasoning expert and a helpful assistant. Don't explain. just do the task"
@@ -479,23 +480,22 @@ def build_sequence(prompt: str, thinking: str, answer: str, source: str = "cladd
     seq_len   = len(full_ids)
     loss_mask = torch.zeros(seq_len, dtype=DTYPE)
 
-    if source == "cladder":
-        think_close_pos = None
-        for i in range(prompt_len, seq_len):
-            if full_ids[i].item() == THINK_CLOSE_ID:
-                think_close_pos = i
-                break
+    # Find </think> — loss starts only after it, thinking tokens get zero weight
+    think_close_pos = None
+    for i in range(prompt_len, seq_len):
+        if full_ids[i].item() == THINK_CLOSE_ID:
+            think_close_pos = i
+            break
 
-        if think_close_pos is not None:
-            loss_mask[prompt_len : think_close_pos + 1] = 1.0
-            answer_pos = think_close_pos + 1
-            if answer_pos < seq_len:
-                loss_mask[answer_pos] = ANSWER_LAMBDA
+    if think_close_pos is not None:
+        response_start = think_close_pos + 1
+        if source == "cladder":
+            if response_start < seq_len:
+                loss_mask[response_start] = ANSWER_LAMBDA
         else:
-            loss_mask[prompt_len:] = 1.0
-    else:
-        # causcibench: CE on all response tokens uniformly
-        loss_mask[prompt_len:] = 1.0
+            if response_start < seq_len:
+                loss_mask[response_start:] = 1.0
+    # else: </think> not found — mask stays all-zero, sample excluded from loss
 
     return {"input_ids": full_ids, "loss_mask": loss_mask, "prompt_len": prompt_len}
 
@@ -568,7 +568,7 @@ def format_groundtruth(gt: dict) -> str:
         if f"step{i}" in gt
     )
 
-TOKENIZED_CACHE = SFT_LORA_OUTPUT_DIR / "tokenized_data_v2.pt"
+TOKENIZED_CACHE = SFT_LORA_OUTPUT_DIR / "tokenized_data_v3.pt"
 
 def load_and_tokenize() -> tuple[SFTDataset, SFTDataset]:
     if not os.path.exists(TOKENIZED_CACHE):
@@ -636,20 +636,31 @@ def build_optimizer(model) -> AdamW:
     )
 
 # -- Evaluate ------------------------------------------------------------------
-def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) -> float:
+def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) -> dict:
     torch.cuda.empty_cache()
     torch.cuda.set_device(device)
     ddp_model.eval()
 
-    cladder_correct, cladder_total = 0, 0
-    causci_rewards = []
+    # CLaDDer tracking
+    cladder_by_rung    = {1: [], 2: [], 3: []}
+    cladder_cs         = []
+    cladder_non_cs     = []
+    cladder_all        = []
+    # CauSciBench tracking
+    causci_pending     = []
+    causci_method      = []
+    causci_treatment   = []
+    causci_outcome     = []
+    causci_effect      = []
+    causci_mres        = []
 
-    yes_id = tokenizer.convert_tokens_to_ids("Yes")
-    no_id  = tokenizer.convert_tokens_to_ids("No")
+    yes_id = tokenizer.convert_tokens_to_ids("yes")
+    no_id  = tokenizer.convert_tokens_to_ids("no")
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             source = batch["source"][0]
+            gt     = batch["groundtruth"][0]
 
             if source == "cladder":
                 input_ids      = batch["input_ids"].to(device)
@@ -664,66 +675,127 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
                 with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
                     outputs = ddp_model.module(input_ids=input_ids, attention_mask=attention_mask)
 
-                answer_logits = outputs.logits[0, answer_pos - 1, :]
-                pred_id       = answer_logits[[yes_id, no_id]].argmax().item()
-                pred_label    = "Yes" if pred_id == 0 else "No"
-                true_label    = tokenizer.decode(input_ids[0, answer_pos]).strip()
+                pred_id    = outputs.logits[0, answer_pos - 1, [yes_id, no_id]].argmax().item()
+                pred_label = "yes" if pred_id == 0 else "no"
+                true_label = tokenizer.decode(input_ids[0, answer_pos]).strip().lower()
+                correct    = int(pred_label == true_label)
 
-                if pred_label.lower() == true_label.lower():
-                    cladder_correct += 1
-                cladder_total += 1
+                cladder_all.append(correct)
+                rung = RUNG_MAP.get(gt.get("step2", ""), 0)
+                if rung in cladder_by_rung:
+                    cladder_by_rung[rung].append(correct)
+                is_cs = gt.get("is_commonsense")
+                if is_cs is not None:
+                    (cladder_cs if is_cs else cladder_non_cs).append(correct)
 
-            else:  # causcibench — generate then call library
+            else:  # causcibench — collect for batched generation
                 prompt_len      = batch["prompt_lens"][0]
                 csv_path        = batch["csv_path"][0]
                 dataset_columns = batch["dataset_columns"][0]
-                gt              = batch["groundtruth"][0]
+                input_ids       = batch["input_ids"].to(device)
+                attention_mask  = batch["attention_mask"].to(device)
+                causci_pending.append({
+                    "prompt_ids":      input_ids[:, :prompt_len],
+                    "prompt_attn":     attention_mask[:, :prompt_len],
+                    "prompt_len":      prompt_len,
+                    "csv_path":        csv_path,
+                    "dataset_columns": dataset_columns,
+                    "gt":              gt,
+                })
 
-                input_ids      = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
+    # Batch-generate all causci samples
+    CAUSCI_GEN_BATCH = 8
+    for i in range(0, len(causci_pending), CAUSCI_GEN_BATCH):
+        chunk    = causci_pending[i : i + CAUSCI_GEN_BATCH]
+        max_plen = max(item["prompt_ids"].shape[1] for item in chunk)
 
-                # batch_size=1 in test loader, no padding — prompt is the first prompt_len tokens
-                prompt_ids  = input_ids[:, :prompt_len]
-                prompt_attn = attention_mask[:, :prompt_len]
+        batch_ids  = torch.full((len(chunk), max_plen), tokenizer.pad_token_id, dtype=torch.long, device=device)
+        batch_attn = torch.zeros(len(chunk), max_plen, dtype=torch.long, device=device)
+        for j, item in enumerate(chunk):
+            plen = item["prompt_ids"].shape[1]
+            batch_ids[j, max_plen - plen:]  = item["prompt_ids"][0]
+            batch_attn[j, max_plen - plen:] = item["prompt_attn"][0]
 
-                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-                    generated = ddp_model.module.generate(
-                        input_ids=prompt_ids,
-                        attention_mask=prompt_attn,
-                        max_new_tokens=512,
-                        do_sample=False,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+            generated = ddp_model.module.generate(
+                input_ids=batch_ids,
+                attention_mask=batch_attn,
+                max_new_tokens=512,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
 
-                new_tokens  = generated[0, prompt_len:]
-                output_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        for j, item in enumerate(chunk):
+            output_text = tokenizer.decode(generated[j, max_plen:], skip_special_tokens=True)
+            if i == 0 and j == 0:
+                print(f"\n[eval sample response]\n{output_text}\n")
+            parsed      = extract_causci(output_text, item["dataset_columns"])
+            gt          = item["gt"]
+            csv_path    = item["csv_path"]
 
-                parsed = extract_causci(output_text, dataset_columns)
-                if parsed is None:
-                    causci_rewards.append(-1.0)
-                    continue
+            if parsed is None:
+                causci_method.append(0)
+                continue
 
-                # attach csv_path so library_fn can load the data
+            pred_method = parsed.get("step2", "").strip().lower()
+            gt_method   = (gt.get("step2") or "").strip().lower()
+            m_ok        = int(pred_method == gt_method)
+            causci_method.append(m_ok)
+            if not m_ok:
+                continue
+
+            pred_s1 = parsed.get("step1") or {}
+            gt_s1   = gt.get("step1") or {}
+
+            t_ok = int(pred_s1.get("treatment", "").strip() == str(gt_s1.get("treatment", "")).strip())
+            causci_treatment.append(t_ok)
+            o_ok = int(pred_s1.get("outcome", "").strip() == str(gt_s1.get("outcome", "")).strip())
+            causci_outcome.append(o_ok)
+
+            if t_ok and o_ok and csv_path:
                 parsed["step1"]["csv_path"] = csv_path
-
                 effect = library_fn(parsed)
-                reward, _ = reward_causci(parsed, gt, effect)
-                causci_rewards.append(reward)
+                ref    = gt.get("step5")
+                if ref is not None and ref != 0:
+                    mre = abs(effect - ref) / abs(ref)
+                    causci_mres.append(mre)
+                    causci_effect.append(int(mre <= 0.05))
 
-    cladder_acc   = cladder_correct / cladder_total if cladder_total > 0 else 0.0
-    causci_reward = sum(causci_rewards) / len(causci_rewards) if causci_rewards else 0.0
+    metrics = {}
 
-    print(f"CLaDDer Accuracy:        {cladder_correct}/{cladder_total} = {cladder_acc:.4f}")
-    print(f"CauSciBench Avg Reward:  {causci_reward:.4f} ({len(causci_rewards)} samples)")
+    if cladder_all:
+        metrics["cladder/overall_acc"] = sum(cladder_all) / len(cladder_all)
+        for r in [1, 2, 3]:
+            if cladder_by_rung[r]:
+                metrics[f"cladder/rung{r}_acc"] = sum(cladder_by_rung[r]) / len(cladder_by_rung[r])
+        if cladder_cs:
+            metrics["cladder/commonsense_acc"]     = sum(cladder_cs)     / len(cladder_cs)
+        if cladder_non_cs:
+            metrics["cladder/non_commonsense_acc"] = sum(cladder_non_cs) / len(cladder_non_cs)
+
+    if causci_method:
+        metrics["causci/method_acc"]    = sum(causci_method)    / len(causci_method)
+    if causci_treatment:
+        metrics["causci/treatment_acc"] = sum(causci_treatment) / len(causci_treatment)
+    if causci_outcome:
+        metrics["causci/outcome_acc"]   = sum(causci_outcome)   / len(causci_outcome)
+    if causci_effect:
+        metrics["causci/effect_acc"]    = sum(causci_effect)    / len(causci_effect)
+    if causci_mres:
+        metrics["causci/mre"]           = sum(causci_mres)      / len(causci_mres)
+
+    for k, v in sorted(metrics.items()):
+        print(f"  {k}: {v:.4f}")
 
     ddp_model.train()
-    return cladder_acc
+    return metrics
 
 import traceback
+import datetime
 
 # ── Training Loop ──────────────────────────────────────────────────────────────
 def train(train_dataset, test_dataset):
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=2))
     local_rank = int(os.environ["LOCAL_RANK"])
     device     = f"cuda:{local_rank}"
     torch.cuda.set_device(local_rank)
@@ -778,15 +850,18 @@ def train(train_dataset, test_dataset):
         optimizer = build_optimizer(ddp_model)
         ddp_model.train()
 
-        yes_id = tokenizer.convert_tokens_to_ids("Yes")
-        no_id  = tokenizer.convert_tokens_to_ids("No")
+        yes_id = tokenizer.convert_tokens_to_ids("yes")
+        no_id  = tokenizer.convert_tokens_to_ids("no")
 
         metric_steps      = []
         metric_train_loss = []
         metric_train_acc  = []
+        eval_steps        = []
+        eval_history      = {}
 
         global_step = 0
         window_loss, window_correct, window_total = 0.0, 0, 0
+        window_causci_correct, window_causci_total = 0, 0
 
         for epoch in range(MAX_EPOCHS):
             train_sampler.set_epoch(epoch)
@@ -803,18 +878,34 @@ def train(train_dataset, test_dataset):
                     loss    = compute_loss(outputs.logits, input_ids, loss_mask)
                     loss    = loss / GRAD_ACCUM
 
-                # Train accuracy — only for cladder samples (those with ANSWER_LAMBDA token)
+                # Train accuracy — cladder uses logit at answer token; causci decodes response tokens
                 with torch.no_grad():
                     for i in range(input_ids.shape[0]):
-                        ans_pos_list = (loss_mask[i] == ANSWER_LAMBDA).nonzero(as_tuple=True)[0]
-                        if len(ans_pos_list) == 0:
-                            continue
-                        ans_pos  = ans_pos_list[0].item()
-                        pred_idx = outputs.logits[i, ans_pos - 1, [yes_id, no_id]].argmax().item()
-                        pred_tok = yes_id if pred_idx == 0 else no_id
-                        if pred_tok == input_ids[i, ans_pos].item():
-                            window_correct += 1
-                        window_total += 1
+                        src = batch["source"][i]
+
+                        if src == "cladder":
+                            ans_pos_list = (loss_mask[i] == ANSWER_LAMBDA).nonzero(as_tuple=True)[0]
+                            if len(ans_pos_list) == 0:
+                                continue
+                            ans_pos  = ans_pos_list[0].item()
+                            pred_idx = outputs.logits[i, ans_pos - 1, [yes_id, no_id]].argmax().item()
+                            pred_tok = yes_id if pred_idx == 0 else no_id
+                            if pred_tok == input_ids[i, ans_pos].item():
+                                window_correct += 1
+                            window_total += 1
+
+                        else:  # causcibench
+                            resp_pos = (loss_mask[i] == 1.0).nonzero(as_tuple=True)[0]
+                            if len(resp_pos) == 0:
+                                continue
+                            pred_ids  = outputs.logits[i, resp_pos - 1, :].argmax(dim=-1)
+                            pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
+                            parsed    = extract_causci(pred_text, batch["dataset_columns"][i])
+                            gt        = batch["groundtruth"][i]
+                            if parsed is not None:
+                                if parsed.get("step2", "").strip().lower() == (gt.get("step2") or "").strip().lower():
+                                    window_causci_correct += 1
+                            window_causci_total += 1
 
                 loss.backward()
                 window_loss  += loss.item() * GRAD_ACCUM
@@ -833,18 +924,34 @@ def train(train_dataset, test_dataset):
                         avg = epoch_loss / (step + 1)
                         print(f"[epoch {epoch+1} | step {global_step}] loss: {avg:.4f}")
 
-                    if global_step % SAVE_EVERY == 0 and local_rank == 0:
-                        train_acc      = window_correct / window_total if window_total > 0 else 0.0
-                        train_loss_avg = window_loss / SAVE_EVERY
-                        metric_steps.append(global_step)
-                        metric_train_loss.append(train_loss_avg)
-                        metric_train_acc.append(train_acc)
-                        window_loss, window_correct, window_total = 0.0, 0, 0
+                    if global_step % SAVE_EVERY == 0:
+                        dist.barrier()  # hold all ranks while rank 0 saves + evaluates
+                        if local_rank == 0:
+                            train_acc       = window_correct / window_total if window_total > 0 else 0.0
+                            causci_train_acc = window_causci_correct / window_causci_total if window_causci_total > 0 else 0.0
+                            train_loss_avg  = window_loss / SAVE_EVERY
+                            metric_steps.append(global_step)
+                            metric_train_loss.append(train_loss_avg)
+                            metric_train_acc.append(train_acc)
+                            window_loss, window_correct, window_total = 0.0, 0, 0
+                            window_causci_correct, window_causci_total = 0, 0
 
-                        ckpt_path = SFT_LORA_CHECKPOINT_DIR / f"step_{global_step}"
-                        ddp_model.module.save_pretrained(ckpt_path)
-                        tokenizer.save_pretrained(ckpt_path)
-                        print(f"Checkpoint saved → {ckpt_path} | train_loss={train_loss_avg:.4f} cladder_train_acc={train_acc:.4f}")
+                            ckpt_path = SFT_LORA_CHECKPOINT_DIR / f"step_{global_step}"
+                            ddp_model.module.save_pretrained(ckpt_path)
+                            tokenizer.save_pretrained(ckpt_path)
+                            print(f"Checkpoint saved → {ckpt_path} | train_loss={train_loss_avg:.4f} cladder_train_acc={train_acc:.4f} causci_train_acc={causci_train_acc:.4f}")
+
+                            step_metrics = evaluate(ddp_model, test_dataloader, device)
+                            eval_steps.append(global_step)
+                            for k, v in step_metrics.items():
+                                eval_history.setdefault(k, []).append(v)
+                            eval_history.setdefault("train/loss", []).append(train_loss_avg)
+                            eval_history.setdefault("train/cladder_acc", []).append(train_acc)
+                            eval_history.setdefault("train/causci_method_acc", []).append(causci_train_acc)
+                            with open(SFT_LORA_PLOT_DIR / "eval_log.jsonl", "a") as f:
+                                f.write(json.dumps({"step": global_step, "train/loss": train_loss_avg, "train/cladder_acc": train_acc, "train/causci_method_acc": causci_train_acc, **step_metrics}) + "\n")
+                            save_eval_plots(eval_history, eval_steps, SFT_LORA_PLOT_DIR)
+                        dist.barrier()  # resume all ranks together
 
             if local_rank == 0:
                 print(f"Epoch {epoch+1} complete. Avg loss: {epoch_loss / len(train_dataloader):.4f}")
@@ -858,19 +965,14 @@ def train(train_dataset, test_dataset):
         dist.destroy_process_group()
 
         if local_rank == 0:
-            test_acc = evaluate(ddp_model, test_dataloader, device)
-            print(f"Final CLaDDer test accuracy: {test_acc:.4f}")
-
-            if metric_steps:
-                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-                axes[0].plot(metric_steps, metric_train_loss); axes[0].set_title("Train Loss");           axes[0].set_xlabel("Step")
-                axes[1].plot(metric_steps, metric_train_acc);  axes[1].set_title("CLaDDer Train Acc");   axes[1].set_xlabel("Step")
-                fig.suptitle(f"Final CLaDDer Test Accuracy: {test_acc:.4f}")
-                fig.tight_layout()
-                plot_path = SFT_LORA_PLOT_DIR / "training_curves.png"
-                fig.savefig(plot_path, dpi=100)
-                plt.close(fig)
-                print(f"Plots saved → {plot_path}")
+            print("Running final evaluation...")
+            final_metrics = evaluate(ddp_model, test_dataloader, device)
+            eval_steps.append(global_step)
+            for k, v in final_metrics.items():
+                eval_history.setdefault(k, []).append(v)
+            with open(SFT_LORA_PLOT_DIR / "eval_log.jsonl", "a") as f:
+                f.write(json.dumps({"step": global_step, **final_metrics}) + "\n")
+            save_eval_plots(eval_history, eval_steps, SFT_LORA_PLOT_DIR)
     except Exception as e:
         print(f"rank {local_rank} CRASHED: {e}", flush=True)
         traceback.print_exc()

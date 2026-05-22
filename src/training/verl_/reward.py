@@ -24,6 +24,18 @@ from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 
 from src.training.tool_calling import library_fn
+from src.training.eval_metrics import compute_eval_metrics, save_eval_plots
+from src.config import PLOT_DIR
+
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+_call_count       = [0]
+_eval_steps       = []
+_eval_history     = {}
+_metric_buffer    = []   # per-call metrics, flushed every LOG_WINDOW calls
+_reward_buffer    = []   # per-call mean reward
+_response_printed = [False]
+LOG_WINDOW        = 50
 
 # ---------------------------------------------------------------------------
 # Judge client
@@ -341,11 +353,13 @@ def reward_fn(
     extra_infos    — dicts from parquet extra_info column
     """
 
+    _call_count[0] += 1
+    call = _call_count[0]
+
     # Phase 1 — unpack and parse all completions
     items = []
     for solution, gt_str, extra_info in zip(solution_strs, ground_truths, extra_infos):
-        gt_wrapper = json.loads(gt_str)
-        gt         = gt_wrapper["ground_truth"]           # unwrap one level from parquet schema
+        gt         = json.loads(gt_str)   # veRL passes reward_model["ground_truth"] directly
         ei         = json.loads(extra_info) if isinstance(extra_info, str) else extra_info
         source     = "cladder" if ei["csv_path"] == "" else "causcibench"
         cols       = ei["dataset_columns"]
@@ -410,6 +424,38 @@ def reward_fn(
 
         rewards.append(reward)
 
+    mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
+    print(f"[verl] call {call:5d}  reward={mean_reward:+.3f}  src={items[0][0]}", flush=True)
+
+    # buffer metrics and reward; flush every LOG_WINDOW calls
+    eval_items = [(src, parsed, gt, csv_path) for (src, parsed, gt, cols, csv_path) in items]
+    _metric_buffer.append(compute_eval_metrics(eval_items))
+    _reward_buffer.append(mean_reward)
+
+    if not _response_printed[0]:
+        print(f"\n[verl] sample response:\n{solution_strs[0][:500]}")
+        _response_printed[0] = True
+
+    if call % LOG_WINDOW == 0:
+        all_keys = set(k for m in _metric_buffer for k in m)
+        avg = {k: sum(m.get(k, 0.0) for m in _metric_buffer) / len(_metric_buffer) for k in all_keys}
+        avg["reward/mean"] = sum(_reward_buffer) / len(_reward_buffer)
+
+        _eval_steps.append(call)
+        for k, v in avg.items():
+            _eval_history.setdefault(k, []).append(v)
+
+        print(f"\n[verl call {call}] avg over last {LOG_WINDOW} samples:")
+        for k, v in sorted(avg.items()):
+            print(f"  {k}: {v:.4f}")
+
+        with open(PLOT_DIR / "eval_log.jsonl", "a") as f:
+            f.write(json.dumps({"call": call, **avg}) + "\n")
+
+        save_eval_plots(_eval_history, _eval_steps, PLOT_DIR)
+        _metric_buffer.clear()
+        _reward_buffer.clear()
+
     return rewards
 
 
@@ -418,6 +464,7 @@ def reward_fn(
 # ---------------------------------------------------------------------------
 
 def compute_score(
+    data_source:  str,
     solution_str: str,
     ground_truth: str,
     extra_info:   dict,

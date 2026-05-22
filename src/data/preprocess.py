@@ -168,6 +168,7 @@ def process_cladder_row(row, split, cladder_prompt):
             "step3": step3,
             "step4": step4,
             "step5": label,
+            "is_commonsense": gt.get("is_commonsense"),
         },
     }
     if has_nan:
@@ -191,7 +192,7 @@ def process_causcibench_row(row, split, csv_failures, causci_prompt):
     if not csv_path.exists():
         print(f"  WARNING: CSV not found for {row['id']}: {csv_path}")
         csv_failures.append(row["id"])
-        raise
+        return None
 
     df = pd.read_csv(csv_path, low_memory=False)
 

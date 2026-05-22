@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --account=a0107
-#SBATCH --job-name=cai_sft_training
-#SBTACH --output=result.out
-#SBATCH --error=results.err
+#SBATCH --job-name=cai_trl_training
+#SBTACH --output=/iopsstor/scratch/cscs/ajannali/project/trl_runs/results_%j.out
+#SBATCH --error=/iopsstor/scratch/cscs/ajannali/project/trl_runs/results_%j.err
 #SBATCH --nodes=1
 #SBATCH --gpus=4
 #SBATCH --partition=normal
@@ -56,6 +56,6 @@ done
 echo "Judge server ready."
 
 # Run policy training on GPU 0-1
-CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3 src/training/train_trl.py
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 src/training/train_trl.py
 
 kill $JUDGE_PID

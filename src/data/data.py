@@ -138,6 +138,7 @@ def load_cladder() -> list[dict]:
                 "step3": row["formal_form"],
                 "step4": row["reasoning"],
                 "step5": row["label"],
+                "is_commonsense": row.get("is_commonsense"),
             },
         })
     return rows
