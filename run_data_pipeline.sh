@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-export OPENAI_API_KEY="your-openAI-key-here"
+export OPENAI_API_KEY="your-key-here"
 
 # export HF_HOME=/iopsstor/scratch/cscs/ajannali/.cache/huggingface
 # export TOKENIZERS_PARALLELISM=false

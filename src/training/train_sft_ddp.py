@@ -653,6 +653,9 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
     causci_outcome     = []
     causci_effect      = []
     causci_mres        = []
+    # Test loss tracking
+    test_loss_sum   = 0.0
+    test_loss_count = 0
 
     yes_id = tokenizer.convert_tokens_to_ids("yes")
     no_id  = tokenizer.convert_tokens_to_ids("no")
@@ -674,6 +677,11 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
 
                 with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
                     outputs = ddp_model.module(input_ids=input_ids, attention_mask=attention_mask)
+
+                loss_mask_dev = batch["loss_mask"].to(device)
+                batch_loss = compute_loss(outputs.logits, input_ids, loss_mask_dev)
+                test_loss_sum   += batch_loss.item()
+                test_loss_count += 1
 
                 pred_id    = outputs.logits[0, answer_pos - 1, [yes_id, no_id]].argmax().item()
                 pred_label = "yes" if pred_id == 0 else "no"
@@ -754,7 +762,7 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
 
             if t_ok and o_ok and csv_path:
                 parsed["step1"]["csv_path"] = csv_path
-                effect = library_fn(parsed)
+                effect, _ = library_fn(parsed)
                 ref    = gt.get("step5")
                 if ref is not None and ref != 0:
                     mre = abs(effect - ref) / abs(ref)
@@ -783,6 +791,9 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
         metrics["causci/effect_acc"]    = sum(causci_effect)    / len(causci_effect)
     if causci_mres:
         metrics["causci/mre"]           = sum(causci_mres)      / len(causci_mres)
+
+    if test_loss_count > 0:
+        metrics["train/test_loss"] = test_loss_sum / test_loss_count
 
     for k, v in sorted(metrics.items()):
         print(f"  {k}: {v:.4f}")

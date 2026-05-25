@@ -14,10 +14,16 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
+def _sanitize_col(name: str) -> str:
+    """Replace characters patsy treats as operators (dots, spaces, hyphens) with underscores."""
+    return re.sub(r'[.\s\-]', '_', str(name))
+
+# @lru_cache(maxsize=64)
 def _load(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    # drop rows where any column is fully null
     df = df.dropna(how="all")
+    # Sanitize column names so patsy formulas never see dots/spaces/hyphens
+    df.columns = [_sanitize_col(c) for c in df.columns]
     return df
 
 
@@ -41,8 +47,13 @@ def _result(coef, se, alpha=0.05):
 # 1. diff_in_means
 # ------------------------------------------------------------------
 def run_diff_in_means(df, treatment, outcome, controls=None):
+    df = df.dropna(subset=[treatment, outcome] + (controls or []))
+    if len(df) < 2:
+        return _result(0.0, 0.0)
     formula = _formula(outcome, treatment, controls)
     model = smf.ols(formula, data=df).fit(cov_type="HC3")
+    if treatment not in model.params:
+        return _result(0.0, 0.0)
     coef = model.params[treatment]
     se   = model.bse[treatment]
     return _result(coef, se)
@@ -52,8 +63,13 @@ def run_diff_in_means(df, treatment, outcome, controls=None):
 # 2. ols
 # ------------------------------------------------------------------
 def run_ols(df, treatment, outcome, controls=None):
+    df = df.dropna(subset=[treatment, outcome] + (controls or []))
+    if len(df) < 2:
+        return _result(0.0, 0.0)
     formula = _formula(outcome, treatment, controls)
     model = smf.ols(formula, data=df).fit(cov_type="HC3")
+    if treatment not in model.params:
+        return _result(0.0, 0.0)
     coef = model.params[treatment]
     se   = model.bse[treatment]
     return _result(coef, se)
@@ -64,6 +80,8 @@ def run_ols(df, treatment, outcome, controls=None):
 # ------------------------------------------------------------------
 def run_ipw(df, treatment, outcome, controls=None, estimand="ATE"):
     df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
+    if len(df) < 2 or df[treatment].nunique() < 2:
+        return _result(0.0, 0.0)
     X = df[controls].values if controls else np.ones((len(df), 1))
     T = df[treatment].values
     Y = df[outcome].values
@@ -81,13 +99,23 @@ def run_ipw(df, treatment, outcome, controls=None, estimand="ATE"):
     if estimand == "ATE":
         w1 = T / ps
         w0 = (1 - T) / (1 - ps)
-        tau = np.mean(Y * w1) / np.mean(w1) - np.mean(Y * w0) / np.mean(w0)
+        denom1, denom0 = np.mean(w1), np.mean(w0)
+        if denom1 == 0 or denom0 == 0:
+            return _result(0.0, 0.0)
+        tau = np.mean(Y * w1) / denom1 - np.mean(Y * w0) / denom0
     elif estimand == "ATT":
         w0 = ps / (1 - ps)
-        tau = np.mean(Y[T == 1]) - np.sum(Y[T == 0] * w0[T == 0]) / np.sum(w0[T == 0])
+        treated = Y[T == 1]
+        denom0 = np.sum(w0[T == 0])
+        if len(treated) == 0 or denom0 == 0:
+            return _result(0.0, 0.0)
+        tau = np.mean(treated) - np.sum(Y[T == 0] * w0[T == 0]) / denom0
     else:  # ATC
         w1 = (1 - ps) / ps
-        tau = np.sum(Y[T == 1] * w1[T == 1]) / np.sum(w1[T == 1]) - np.mean(Y[T == 0])
+        denom1 = np.sum(w1[T == 1])
+        if len(Y[T == 0]) == 0 or denom1 == 0:
+            return _result(0.0, 0.0)
+        tau = np.sum(Y[T == 1] * w1[T == 1]) / denom1 - np.mean(Y[T == 0])
 
     # bootstrap SE
     n_boot = 200
@@ -116,6 +144,8 @@ def run_matching(df, treatment, outcome, controls=None, estimand="ATT"):
     from sklearn.neighbors import NearestNeighbors
 
     df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
+    if len(df) < 2 or df[treatment].nunique() < 2:
+        return _result(0.0, 0.0)
     X = df[controls].values if controls else np.ones((len(df), 1))
     T = df[treatment].values
     Y = df[outcome].values
@@ -130,6 +160,8 @@ def run_matching(df, treatment, outcome, controls=None, estimand="ATT"):
 
     treated_idx   = np.where(T == 1)[0]
     control_idx   = np.where(T == 0)[0]
+    if len(treated_idx) == 0 or len(control_idx) == 0:
+        return _result(0.0, 0.0)
 
     nn = NearestNeighbors(n_neighbors=1)
     nn.fit(ps[control_idx])
@@ -181,28 +213,44 @@ def run_did(df, treatment, outcome, time_variable, group_variable, controls=None
         treat = group_variable
         interaction = f"{post}_x_{treat}"
         df[interaction] = df[post] * df[treat]
+        # Explicit dropna so df[group_variable] stays in sync with smf's design matrix
+        df = df.dropna(subset=[outcome, post, treat, interaction] + (controls or []))
+        if len(df) < 2:
+            return _result(0.0, 0.0)
         rhs = [post, treat, interaction] + (controls or [])
         formula = f"{outcome} ~ {' + '.join(rhs)}"
         model = smf.ols(formula, data=df).fit(
             cov_type="cluster", cov_kwds={"groups": df[group_variable]}
         )
+        if interaction not in model.params:
+            return _result(0.0, 0.0)
         coef = model.params[interaction]
         se   = model.bse[interaction]
     else:
         # TWFE — staggered treatment
+        df = df.dropna(subset=[treatment, outcome, group_variable, time_variable] + (controls or []))
+        if len(df) < 2:
+            return _result(0.0, 0.0)
         df["unit_id"] = pd.Categorical(df[group_variable]).codes
         df["time_id"] = pd.Categorical(df[time_variable]).codes
         df = df.set_index(["unit_id", "time_id"])
 
         exog_cols = [treatment] + (controls or [])
         exog = df[exog_cols]
+        # PanelOLS.has_constant fails when >1 column is all-constant; drop them
+        exog = exog.loc[:, exog.apply(lambda c: c.nunique() > 1)]
+        if treatment not in exog.columns:
+            return _result(0.0, 0.0)
         model = PanelOLS(
             df[outcome],
             exog,
             entity_effects=True,
             time_effects=True,
             check_rank=False,
+            drop_absorbed=True,
         ).fit(cov_type="clustered", cluster_entity=True)
+        if treatment not in model.params.index:
+            return _result(0.0, 0.0)
         coef = float(model.params[treatment])
         se   = float(model.std_errors[treatment])
 
@@ -215,19 +263,25 @@ def run_did(df, treatment, outcome, time_variable, group_variable, controls=None
 def run_rdd(df, treatment, outcome, running_variable, cutoff, controls=None):
     from rdd import rdd
 
-    df = df.copy()
+    df = df.copy().dropna(subset=[running_variable, outcome] + (controls or []))
+    if len(df) < 2:
+        return _result(0.0, 0.0)
     # rdd package expects the running variable centered at cutoff
     df["_running"] = df[running_variable] - cutoff
 
-    result = rdd.rdd(
-        data=df,
-        cutpoint=0.0,
-        y_var=outcome,
-        x_var="_running",
+    model = rdd.rdd(
+        input_data=df,
+        xname="_running",
+        yname=outcome,
+        cut=0.0,
         controls=controls or [],
+        verbose=False,
     )
-    coef = result.params["LATE"]
-    se   = result.bse["LATE"]
+    result = model.fit()
+    if "TREATED" not in result.params:
+        return _result(0.0, 0.0)
+    coef = result.params["TREATED"]
+    se   = result.bse["TREATED"]
     return _result(coef, se)
 
 
@@ -236,9 +290,26 @@ def run_rdd(df, treatment, outcome, running_variable, cutoff, controls=None):
 # ------------------------------------------------------------------
 def run_iv(df, treatment, outcome, instrument, controls=None):
     df = df.copy().dropna(subset=[treatment, outcome, instrument] + (controls or []))
+    if len(df) < 2:
+        return _result(0.0, 0.0)
+    if df[treatment].nunique() < 2 or df[instrument].nunique() < 2:
+        return _result(0.0, 0.0)
 
-    exog_cols = ["const"] + (controls or [])
     df["const"] = 1.0
+    # Drop zero-variance controls — IV2SLS does a strict full-rank check on [exog, endog]
+    valid_controls = [c for c in (controls or []) if df[c].nunique() > 1]
+    exog_cols = ["const"] + valid_controls
+
+    # Pre-check both rank conditions that IV2SLS._validate_inputs() enforces
+    try:
+        mat_endog = np.column_stack([df[exog_cols].values, df[[treatment]].values]).astype(float)
+        mat_instr = np.column_stack([df[exog_cols].values, df[[instrument]].values]).astype(float)
+    except (ValueError, TypeError):
+        return _result(0.0, 0.0)
+    if np.linalg.matrix_rank(mat_endog) < mat_endog.shape[1]:
+        return _result(0.0, 0.0)
+    if np.linalg.matrix_rank(mat_instr) < mat_instr.shape[1]:
+        return _result(0.0, 0.0)
 
     model = IV2SLS(
         dependent=df[outcome],
@@ -268,6 +339,8 @@ def run_frontdoor(df, treatment, outcome, mediator, controls=None):
     df = df.copy().dropna(
         subset=[treatment, outcome, mediator] + (controls or [])
     )
+    if len(df) < 2:
+        return _result(0.0, 0.0)
 
     def _frontdoor_ate(df):
         # stage 1: T -> M
@@ -307,6 +380,8 @@ def run_frontdoor(df, treatment, outcome, mediator, controls=None):
 # ------------------------------------------------------------------
 def run_glm(df, treatment, outcome, controls=None):
     df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
+    if len(df) < 2:
+        return _result(0.0, 0.0)
     formula = _formula(outcome, treatment, controls)
 
     # detect outcome type
@@ -319,13 +394,23 @@ def run_glm(df, treatment, outcome, controls=None):
     )
 
     if is_binary:
-        model = smf.logit(formula, data=df).fit(disp=False)
+        if len(unique_vals) < 2:
+            return _result(0.0, 0.0)
+        try:
+            model = smf.logit(formula, data=df).fit(disp=False)
+        except np.linalg.LinAlgError:
+            model = smf.ols(formula, data=df).fit(cov_type="HC3")
     elif is_count:
-        model = smf.poisson(formula, data=df).fit(disp=False)
+        try:
+            model = smf.poisson(formula, data=df).fit(disp=False)
+        except np.linalg.LinAlgError:
+            model = smf.ols(formula, data=df).fit(cov_type="HC3")
     else:
         # fallback to OLS if outcome doesn't fit binary or count
         model = smf.ols(formula, data=df).fit(cov_type="HC3")
 
+    if treatment not in model.params:
+        return _result(0.0, 0.0)
     coef = model.params[treatment]
     se   = model.bse[treatment]
     return _result(coef, se)
@@ -346,7 +431,7 @@ ESTIMATORS = {
     "glm":           run_glm,
 }
 
-def library_fn(parsed_prediction: dict) -> float:
+def library_fn(parsed_prediction: dict) -> (float, bool):
     """
     Receives parsed CauSciBench prediction, loads CSV, runs the
     appropriate estimator, returns the effect as a float.
@@ -358,9 +443,10 @@ def library_fn(parsed_prediction: dict) -> float:
 
     df = _load(s1["csv_path"])
 
-    treatment = s1["treatment"]
-    outcome   = s1["outcome"]
-    controls  = s1.get("controls") or []
+    # _load sanitizes column names (dots/spaces → underscores); mirror that here
+    treatment = _sanitize_col(s1["treatment"])
+    outcome   = _sanitize_col(s1["outcome"])
+    controls  = [_sanitize_col(c) for c in (s1.get("controls") or [])]
 
     if method in ("diff_in_means", "ols", "glm"):
         result = ESTIMATORS[method](df, treatment, outcome, controls)
@@ -376,22 +462,22 @@ def library_fn(parsed_prediction: dict) -> float:
     elif method == "did":
         result = run_did(
             df, treatment, outcome,
-            s1["time_variable"], s1["group_variable"], controls
+            _sanitize_col(s1["time_variable"]), _sanitize_col(s1["group_variable"]), controls
         )
 
     elif method == "rdd":
         result = run_rdd(
             df, treatment, outcome,
-            s1["running_variable"], float(s1["cutoff"]), controls
+            _sanitize_col(s1["running_variable"]), float(s1["cutoff"]), controls
         )
 
     elif method == "iv":
-        result = run_iv(df, treatment, outcome, s1["instrument"], controls)
+        result = run_iv(df, treatment, outcome, _sanitize_col(s1["instrument"]), controls)
 
     elif method == "frontdoor":
-        result = run_frontdoor(df, treatment, outcome, s1["mediator"], controls)
+        result = run_frontdoor(df, treatment, outcome, _sanitize_col(s1["mediator"]), controls)
 
     else:
-        return 0.0
+        return 0.0, False
 
-    return result["effect"]
+    return result["effect"], True

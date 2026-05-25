@@ -343,7 +343,7 @@ class TestTRLRewardFn:
             "step5": 0.5,
         }
         completion = _raw(VALID_CAUSCI)
-        with patch.object(trl_mod, "cached_library_fn", return_value=0.5):
+        with patch.object(trl_mod, "cached_library_fn", return_value=(0.5, True)):
             rewards = trl_mod.reward_fn(
                 [completion],
                 source=["causcibench"],
@@ -358,7 +358,7 @@ class TestTRLRewardFn:
                         "controls": ["age"]},
               "step2": "ipw", "step5": 0.5}
         completion = _raw(VALID_CAUSCI)   # predicts "ols", gt wants "ipw"
-        with patch.object(trl_mod, "cached_library_fn", return_value=0.5):
+        with patch.object(trl_mod, "cached_library_fn", return_value=(0.5, True)):
             rewards = trl_mod.reward_fn(
                 [completion],
                 source=["causcibench"],
@@ -375,7 +375,7 @@ class TestTRLRewardFn:
                                            "controls": ["age"]},
                                  "step2": "ols", "step5": 0.5})
         with patch.object(trl_mod, "batch_judge", return_value=[1.0, 1.0]), \
-             patch.object(trl_mod, "cached_library_fn", return_value=0.5):
+             patch.object(trl_mod, "cached_library_fn", return_value=(0.5, True)):
             rewards = trl_mod.reward_fn(
                 [_raw(VALID_CLADDER), _raw(VALID_CAUSCI)],
                 source=["cladder", "causcibench"],
@@ -396,7 +396,7 @@ def _verl_extra(csv_path="", cols=None):
     return json.dumps({"csv_path": csv_path, "dataset_columns": cols or []})
 
 def _verl_gt(d):
-    return json.dumps({"ground_truth": d})
+    return json.dumps(d)
 
 def _verl_cladder_call(completion, gt_dict, judge_scores):
     with patch.object(verl_mod, "batch_judge", return_value=judge_scores):
@@ -443,7 +443,7 @@ class TestVeRLRewardFn:
         gt = {"step1": {"treatment": "education", "outcome": "salary",
                         "controls": ["age"]},
               "step2": "ols", "step5": 0.5}
-        with patch.object(verl_mod, "cached_library_fn", return_value=0.5):
+        with patch.object(verl_mod, "cached_library_fn", return_value=(0.5, True)):
             rewards = verl_mod.reward_fn(
                 [_raw(VALID_CAUSCI)],
                 [_verl_gt(gt)],
@@ -452,23 +452,26 @@ class TestVeRLRewardFn:
         assert rewards[0] == pytest.approx(1.0)
 
     def test_causci_wrong_method(self):
+        # veRL uses weighted formula (no early exit on wrong method).
+        # method=0, treatment=1, outcome=1, controls=1, effect=0
+        # → (0.15+0.10+0.15)*2 - 1 = -0.20
         gt = {"step1": {"treatment": "education", "outcome": "salary",
                         "controls": ["age"]},
               "step2": "ipw", "step5": 0.5}
-        with patch.object(verl_mod, "cached_library_fn", return_value=0.5):
+        with patch.object(verl_mod, "cached_library_fn", return_value=(0.5, True)):
             rewards = verl_mod.reward_fn(
                 [_raw(VALID_CAUSCI)],
                 [_verl_gt(gt)],
                 [_verl_extra("some/path.csv", CAUSCI_COLS)],
             )
-        assert rewards[0] == pytest.approx(-1.0)
+        assert rewards[0] == pytest.approx(-0.20)
 
     def test_mixed_batch(self):
         causci_gt = {"step1": {"treatment": "education", "outcome": "salary",
                                "controls": ["age"]},
                      "step2": "ols", "step5": 0.5}
         with patch.object(verl_mod, "batch_judge", return_value=[1.0, 1.0]), \
-             patch.object(verl_mod, "cached_library_fn", return_value=0.5):
+             patch.object(verl_mod, "cached_library_fn", return_value=(0.5, True)):
             rewards = verl_mod.reward_fn(
                 [_raw(VALID_CLADDER), _raw(VALID_CAUSCI)],
                 [_verl_gt(VALID_CLADDER), _verl_gt(causci_gt)],

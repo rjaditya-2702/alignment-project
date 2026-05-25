@@ -187,9 +187,9 @@ def _resolve_csv_path(stored: str) -> str:
                 return str(PROJECT_ROOT / Path(*p.parts[i:]))
     raise ValueError(f"Cannot resolve csv_path — no anchor found: {stored}")
 
-def _build_extra_info(row: dict) -> dict:
+def _build_extra_info(row: dict, split: str) -> dict:
     if row["source"] == "cladder":
-        return {"csv_path": "", "dataset_columns": []}
+        return {"csv_path": "", "dataset_columns": [], "split": split}
 
     stored = row.get("csv_path")
     if not stored:
@@ -199,7 +199,7 @@ def _build_extra_info(row: dict) -> dict:
 
     csv_path = _resolve_csv_path(stored)
     dataset_columns = pd.read_csv(csv_path, nrows=0).columns.tolist()
-    return {"csv_path": csv_path, "dataset_columns": dataset_columns}
+    return {"csv_path": csv_path, "dataset_columns": dataset_columns, "split": split}
 
 CLADDER_TRAIN_LIMIT = 10_000  # set to None to use full dataset
 
@@ -233,7 +233,7 @@ def _limit_cladder(rows: list[dict], limit: int) -> list[dict]:
     return kept + other
 
 
-def _convert_split(jsonl_path: Path, parquet_path: Path, limit: int | None = None) -> None:
+def _convert_split(jsonl_path: Path, parquet_path: Path, split: str, limit: int | None = None) -> None:
     if not jsonl_path.exists():
         raise FileNotFoundError(f"JSONL not found: {jsonl_path}. Run preprocess() first.")
 
@@ -252,7 +252,7 @@ def _convert_split(jsonl_path: Path, parquet_path: Path, limit: int | None = Non
                 "prompt":       _build_messages(row),
                 "data_source":  row["source"],
                 "reward_model": {"ground_truth": json.dumps(row["groundtruth"])},
-                "extra_info":   _build_extra_info(row),
+                "extra_info":   _build_extra_info(row, split),
             })
         except Exception as e:
             raise FileNotFoundError(f"Error processing row with id {row.get('id', '?')}: {e}")
@@ -268,8 +268,8 @@ def main():
     print("Preprocessing complete.")
 
     print("Preparing veRL parquet files...")
-    _convert_split(output_dir / "train.jsonl", output_dir / "train.parquet", limit=CLADDER_TRAIN_LIMIT)
-    _convert_split(output_dir / "test.jsonl",  output_dir / "test.parquet")
+    _convert_split(output_dir / "train.jsonl", output_dir / "train.parquet", split="train", limit=CLADDER_TRAIN_LIMIT)
+    _convert_split(output_dir / "test.jsonl",  output_dir / "test.parquet",  split="test")
     print("Done.")
 
 

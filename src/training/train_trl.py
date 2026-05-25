@@ -701,7 +701,7 @@ def reward_fn(completions: list, **kwargs) -> list[float]:
                 rewards.append(-1.0)
                 continue
             step1          = parsed["step1"]
-            library_effect = cached_library_fn(
+            library_effect, _ = cached_library_fn(
                 csv_path                  = csv_path,
                 method                    = parsed["step2"],
                 treatment                 = step1["treatment"],
@@ -714,7 +714,7 @@ def reward_fn(completions: list, **kwargs) -> list[float]:
                 time_variable             = step1.get("time_variable"),
                 group_variable            = step1.get("group_variable"),
                 mediator                  = step1.get("mediator"),
-            ) if parsed["step2"] == gt.get("step2") else 0.0
+            ) if parsed["step2"] == gt.get("step2") else (0.0, False)
             reward, _ = reward_causci(parsed, gt, library_effect)
 
         else:

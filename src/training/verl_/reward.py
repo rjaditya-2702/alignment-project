@@ -15,27 +15,26 @@ Internal flow (identical to TRL):
     Phase 1 — parse all completions
     Phase 2 — batch all cladder judge calls, fire concurrently
     Phase 3 — score with pre-fetched judge results
+
+Logging:
+    Training calls print: [verl] call {N} reward={mean:+.3f} src={src}
+    Eval passes print:    [verl_eval] eval_pass:{N} key:value ...
+    veRL native console lines carry step, loss, KL — parsed separately.
 """
 
 import re
 import json
+import atexit
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 
 from src.training.tool_calling import library_fn
-from src.training.eval_metrics import compute_eval_metrics, save_eval_plots
-from src.config import PLOT_DIR
+from src.training.eval_metrics import compute_eval_metrics
 
-PLOT_DIR.mkdir(parents=True, exist_ok=True)
-
-_call_count       = [0]
-_eval_steps       = []
-_eval_history     = {}
-_metric_buffer    = []   # per-call metrics, flushed every LOG_WINDOW calls
-_reward_buffer    = []   # per-call mean reward
-_response_printed = [False]
-LOG_WINDOW        = 50
+_call_count   = [0]
+_eval_buffer  = []   # accumulates (src, parsed, gt, csv_path) for test-split calls
+_eval_pass    = [0]  # number of eval passes completed
 
 # ---------------------------------------------------------------------------
 # Judge client
@@ -139,60 +138,128 @@ def reward_cladder_precomputed(
 
     return reward, scores
 
-
-def reward_causci(
-    prediction: dict,
-    ground_truth: dict,
-    library_effect: float,
-) -> tuple[float, dict]:
+def reward_causci(prediction, ground_truth, library_effect, library_success):
     scores = {}
-
-    pred_method = prediction.get('step2', '').strip().lower()
-    ref_method  = ground_truth.get('step2', '').strip().lower()
-    scores['method'] = 1 if pred_method == ref_method else 0
-
-    if scores['method'] == 0:
-        return -1.0, scores
-
-    pred_treat = prediction.get('step1', {}).get('treatment', '').strip()
-    ref_treat  = ground_truth.get('step1', {}).get('treatment', '').strip()
-    scores['treatment'] = 1 if pred_treat == ref_treat else 0
-
-    pred_outcome = prediction.get('step1', {}).get('outcome', '').strip()
-    ref_outcome  = ground_truth.get('step1', {}).get('outcome', '').strip()
-    scores['outcome'] = 1 if pred_outcome == ref_outcome else 0
-
-    if scores['treatment'] == 0 or scores['outcome'] == 0:
-        return -0.5, scores
-
-    pred_controls = set(prediction.get('step1', {}).get('controls', []))
-    ref_controls  = set(ground_truth.get('step1', {}).get('controls', []))
-    if len(ref_controls) > 0:
-        scores['controls'] = len(pred_controls & ref_controls) / len(ref_controls)
+    
+    # 1. method (exact match)
+    p = prediction.get('step2', '')
+    if p is not None:
+        p = p.strip().lower()
+    r = ground_truth.get('step2', '')
+    if r is not None:
+        r = r.strip().lower()
+    scores['method'] = int(
+        p == r
+    )
+    
+    # 2. treatment / outcome (exact match, normalized)
+    for k in ['treatment', 'outcome']:
+        p = prediction['step1']
+        if p is not None:
+            p = p.get(k, '')
+        if p is not None:
+            p = p.strip().lower()
+        r = ground_truth['step1']
+        if r is not None:
+            r = r.get(k, '')
+        if r is not None:
+            r = r.strip().lower()
+        scores[k] = int(p == r)
+    
+    # 3. controls (Jaccard-style, matches VSA)
+    prediction_step1 = prediction.get('step1', {})
+    if prediction_step1 is None:
+        prediction_step1 = {}
+    ground_truth_step1 = ground_truth.get('step1', {})
+    if ground_truth_step1 is None:
+        ground_truth_step1 = {}
+    pc = {c.strip().lower() for c in (prediction_step1.get('controls') or [])}
+    rc = {c.strip().lower() for c in (ground_truth_step1.get('controls') or [])}
+    if rc:
+        scores['controls'] = len(pc & rc) / len(rc)
     else:
-        scores['controls'] = 1.0 if len(pred_controls) == 0 else 0.0
-
-    controls_good = scores['controls'] >= 0.75
-
-    ref_effect = ground_truth.get('step5')
-    if ref_effect is not None and ref_effect != 0:
-        mre = abs(library_effect - ref_effect) / abs(ref_effect)
-        effect_correct = mre <= 0.05
+        scores['controls'] = 1.0 if not pc else 0.0
+    
+    # 4. effect (paper's EA, with zero-handling)
+    ref = ground_truth.get('step5')
+    if not library_success or ref is None:
+        scores['effect'] = 0.0
+    elif abs(ref) < 1e-6:
+        scores['effect'] = float(abs(library_effect) < 1e-3)
     else:
-        effect_correct = False
-
-    scores['effect'] = 1 if effect_correct else 0
-
-    if controls_good and effect_correct:
-        reward = 1.0
-    elif not controls_good and effect_correct:
-        reward = 0.5
-    elif controls_good and not effect_correct:
-        reward = -0.25
-    else:
-        reward = -0.25
-
+        mre = abs(library_effect - ref) / abs(ref)
+        scores['effect'] = float(mre <= 0.05)
+    
+    # weighted linear combination
+    reward = (
+        0.30 * scores['method']
+        + 0.15 * scores['treatment']
+        + 0.10 * scores['outcome']
+        + 0.15 * scores['controls']
+        + 0.30 * scores['effect']
+    ) * 2 - 1  # rescale [0,1] -> [-1,1]
+    
     return reward, scores
+
+# def reward_causci(
+#     prediction: dict,
+#     ground_truth: dict,
+#     library_effect: float,
+# ) -> tuple[float, dict]:
+#     scores = {}
+
+#     pred_method = prediction.get('step2', '').strip().lower()
+#     ref_method  = ground_truth.get('step2', '')
+#     if ref_method is not None:
+#         ref_method = ref_method.strip().lower()
+#     scores['method'] = 1 if pred_method == ref_method else 0
+
+#     if scores['method'] == 0:
+#         return -1.0, scores
+
+#     pred_treat = prediction.get('step1', {}).get('treatment', '').strip()
+#     ref_treat  = ground_truth.get('step1', {}).get('treatment', '').strip()
+#     if ref_treat is not None:
+#         ref_treat = ref_treat.strip()
+#     scores['treatment'] = 1 if pred_treat == ref_treat else 0
+
+#     pred_outcome = prediction.get('step1', {}).get('outcome', '').strip()
+#     ref_outcome  = ground_truth.get('step1', {}).get('outcome', '')
+#     if ref_outcome is not None:
+#         ref_outcome = ref_outcome.strip()
+#     scores['outcome'] = 1 if pred_outcome == ref_outcome else 0
+
+#     if scores['treatment'] == 0 or scores['outcome'] == 0:
+#         return -0.5, scores
+
+#     pred_controls = set(prediction.get('step1', {}).get('controls') or [])
+#     ref_controls  = set(ground_truth.get('step1', {}).get('controls') or [])
+#     if len(ref_controls) > 0:
+#         scores['controls'] = len(pred_controls & ref_controls) / len(ref_controls)
+#     else:
+#         scores['controls'] = 1.0 if len(pred_controls) == 0 else 0.0
+
+#     controls_good = scores['controls'] >= 0.75
+
+#     ref_effect = ground_truth.get('step5')
+#     if ref_effect is not None and ref_effect != 0:
+#         mre = abs(library_effect - ref_effect) / abs(ref_effect)
+#         effect_correct = mre <= 0.05
+#     else:
+#         effect_correct = False
+
+#     scores['effect'] = 1 if effect_correct else 0
+
+#     if controls_good and effect_correct:
+#         reward = 1.0
+#     elif not controls_good and effect_correct:
+#         reward = 0.5
+#     elif controls_good and not effect_correct:
+#         reward = -0.25
+#     else:
+#         reward = -0.25
+
+#     return reward, scores
 
 
 # ---------------------------------------------------------------------------
@@ -267,14 +334,14 @@ def extract_causci(model_output: str, dataset_columns: list[str]) -> dict | None
     if method not in CAUSCI_METHODS:
         return None
 
-    treatment = step1.get('treatment', '').strip()
-    outcome   = step1.get('outcome', '').strip()
+    treatment = (step1.get('treatment') or '').strip()
+    outcome   = (step1.get('outcome') or '').strip()
     if treatment not in dataset_columns:
         return None
     if outcome not in dataset_columns:
         return None
 
-    controls = [c for c in step1.get('controls', []) if c in dataset_columns]
+    controls = [c for c in (step1.get('controls') or []) if c in dataset_columns]
 
     if method == 'iv':
         if step1.get('instrument') not in dataset_columns:
@@ -304,7 +371,7 @@ def extract_causci(model_output: str, dataset_columns: list[str]) -> dict | None
             'time_variable':    step1.get('time_variable'),
             'group_variable':   step1.get('group_variable'),
             'mediator':         step1.get('mediator'),
-            'estimand':         step1.get('estimand', '').strip().lower(),
+            'estimand':         (step1.get('estimand') or '').strip().lower(),
         },
         'step2': method,
     }
@@ -337,13 +404,32 @@ def cached_library_fn(
     })
 
 # ---------------------------------------------------------------------------
+# Eval flush
+# ---------------------------------------------------------------------------
+
+def _flush_eval_buffer():
+    """Compute and log eval metrics from accumulated test-split samples."""
+    if not _eval_buffer:
+        return
+    _eval_pass[0] += 1
+    metrics = compute_eval_metrics(_eval_buffer)
+    parts = " ".join(f"{k}:{v:.4f}" for k, v in sorted(metrics.items()))
+    print(f"[verl_eval] eval_pass:{_eval_pass[0]} {parts}", flush=True)
+    _eval_buffer.clear()
+
+# Flush any remaining eval samples when the process exits (e.g. training ends
+# immediately after an eval pass with no subsequent training call to trigger flush).
+atexit.register(_flush_eval_buffer)
+
+# ---------------------------------------------------------------------------
 # veRL reward interface
 # ---------------------------------------------------------------------------
+import time
 
 def reward_fn(
     solution_strs: list[str],
     ground_truths: list[str],   # JSON strings: {"ground_truth": {...}}
-    extra_infos:   list[dict],  # {"csv_path": str, "dataset_columns": list[str]}
+    extra_infos:   list[dict],  # {"csv_path": str, "dataset_columns": list[str], "split": str}
 ) -> list[float]:
     """
     veRL RewardManager entry point.
@@ -358,27 +444,28 @@ def reward_fn(
 
     # Phase 1 — unpack and parse all completions
     items = []
+    t0 = time.time()
     for solution, gt_str, extra_info in zip(solution_strs, ground_truths, extra_infos):
-        gt         = json.loads(gt_str)   # veRL passes reward_model["ground_truth"] directly
+        gt         = json.loads(gt_str)
         ei         = json.loads(extra_info) if isinstance(extra_info, str) else extra_info
         source     = "cladder" if ei["csv_path"] == "" else "causcibench"
         cols       = ei["dataset_columns"]
         csv_path   = ei["csv_path"]
+        split      = ei.get("split", "train")
 
         parsed = extract_cladder(solution) if source == "cladder" else extract_causci(solution, cols)
-        items.append((source, parsed, gt, cols, csv_path))
+        items.append((source, parsed, gt, cols, csv_path, split))
 
     # Phase 2 — collect all cladder judge prompts and fire concurrently
     judge_prompts = []
     prompt_idx    = {}  # item index → {"step1": int, "step3": int}
 
-    for i, (source, parsed, gt, cols, csv_path) in enumerate(items):
+    for i, (source, parsed, gt, cols, csv_path, split) in enumerate(items):
         if source != "cladder" or parsed is None:
             continue
         prompt_idx[i] = {}
         prompt_idx[i]["step1"] = len(judge_prompts)
         judge_prompts.append(_make_step1_prompt(parsed, gt))
-        # step3 judge only fires if step2 is already correct — avoids a wasted call
         if parsed.get('step2', '').strip().lower() == gt.get('step2', '').strip().lower():
             prompt_idx[i]["step3"] = len(judge_prompts)
             judge_prompts.append(_make_step3_prompt(parsed, gt))
@@ -387,7 +474,7 @@ def reward_fn(
 
     # Phase 3 — score using pre-fetched judge results
     rewards = []
-    for i, (source, parsed, gt, cols, csv_path) in enumerate(items):
+    for i, (source, parsed, gt, cols, csv_path, split) in enumerate(items):
 
         if source == "cladder":
             if parsed is None:
@@ -403,12 +490,12 @@ def reward_fn(
                 rewards.append(-1.0)
                 continue
             step1          = parsed["step1"]
-            library_effect = cached_library_fn(
+            library_effect, library_success = cached_library_fn(
                 csv_path                  = csv_path,
                 method                    = parsed["step2"],
                 treatment                 = step1["treatment"],
                 outcome                   = step1["outcome"],
-                controls_tuple            = tuple(step1["controls"]),
+                controls_tuple            = tuple(step1.get("controls") or []),
                 estimand                  = step1.get("estimand"),
                 instrument                = step1.get("instrument"),
                 running_variable          = step1.get("running_variable"),
@@ -416,8 +503,8 @@ def reward_fn(
                 time_variable             = step1.get("time_variable"),
                 group_variable            = step1.get("group_variable"),
                 mediator                  = step1.get("mediator"),
-            ) if parsed["step2"] == gt.get("step2") else 0.0
-            reward, _ = reward_causci(parsed, gt, library_effect)
+            ) if parsed["step2"] == gt.get("step2") else (0.0, False)
+            reward, _ = reward_causci(parsed, gt, library_effect, library_success)
 
         else:
             raise ValueError(f"Unknown source: {source!r}")
@@ -425,42 +512,93 @@ def reward_fn(
         rewards.append(reward)
 
     mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
-    print(f"[verl] call {call:5d}  reward={mean_reward:+.3f}  src={items[0][0]}", flush=True)
+    split_tag   = items[0][5] if items else "train"
 
-    # buffer metrics and reward; flush every LOG_WINDOW calls
-    eval_items = [(src, parsed, gt, csv_path) for (src, parsed, gt, cols, csv_path) in items]
-    _metric_buffer.append(compute_eval_metrics(eval_items))
-    _reward_buffer.append(mean_reward)
+    # If switching from eval back to train, flush accumulated eval buffer
+    if split_tag == "train" and _eval_buffer:
+        _flush_eval_buffer()
 
-    if not _response_printed[0]:
-        print(f"\n[verl] sample response:\n{solution_strs[0][:500]}")
-        _response_printed[0] = True
-
-    if call % LOG_WINDOW == 0:
-        all_keys = set(k for m in _metric_buffer for k in m)
-        avg = {k: sum(m.get(k, 0.0) for m in _metric_buffer) / len(_metric_buffer) for k in all_keys}
-        avg["reward/mean"] = sum(_reward_buffer) / len(_reward_buffer)
-
-        _eval_steps.append(call)
-        for k, v in avg.items():
-            _eval_history.setdefault(k, []).append(v)
-
-        print(f"\n[verl call {call}] avg over last {LOG_WINDOW} samples:")
-        for k, v in sorted(avg.items()):
-            print(f"  {k}: {v:.4f}")
-
-        with open(PLOT_DIR / "eval_log.jsonl", "a") as f:
-            f.write(json.dumps({"call": call, **avg}) + "\n")
-
-        save_eval_plots(_eval_history, _eval_steps, PLOT_DIR)
-        _metric_buffer.clear()
-        _reward_buffer.clear()
-
+    if split_tag == "test":
+        print(f"[verl_eval] eval_pass:{_eval_pass[0]} call:{call:5d} reward={mean_reward:+.3f} src={items[0][0]}", flush=True)
+        eval_items = [(src, parsed, gt, csv_path) for (src, parsed, gt, cols, csv_path, split) in items]
+        _eval_buffer.extend(eval_items)
+    else:
+        print(f"[verl] call {call:5d}  reward={mean_reward:+.3f}  src={items[0][0]}", flush=True)
+    print(f"[reward] n={len(rewards)} dt={time.time()-t0:.2f}s", flush=True)
     return rewards
 
 
 # ---------------------------------------------------------------------------
-# Per-sample fallback — for veRL's default compute_score interface if needed
+# Batch reward manager — patches NaiveRewardManager to process the whole
+# batch at once so all CLaDDer judge calls fire concurrently via batch_judge.
+#
+# Timing: veRL loads this file (exec_module) BEFORE instantiating
+# NaiveRewardManager in the same Ray actor process, so the patch is in place
+# when the manager is created.  compute_score still has to exist (veRL loads
+# it by name), but the patched __call__ bypasses it entirely.
+# ---------------------------------------------------------------------------
+
+def _install_batch_reward_manager() -> None:
+    try:
+        import torch
+        import verl.workers.reward_manager.naive as _naive
+
+        def _batch_call(self_rm, data, return_dict=False):
+            responses = data.batch['responses']          # [N, max_response_len]
+            n = responses.shape[0]
+
+            # Decode all completions
+            if 'response_length' in data.batch:
+                resp_lens = [int(data.batch['response_length'][i]) for i in range(n)]
+                solution_strs = [
+                    self_rm.tokenizer.decode(
+                        responses[i, :resp_lens[i]], skip_special_tokens=True
+                    )
+                    for i in range(n)
+                ]
+            else:
+                pad = self_rm.tokenizer.pad_token_id
+                solution_strs, resp_lens = [], []
+                for i in range(n):
+                    tokens = responses[i]
+                    valid  = tokens[tokens != pad]
+                    resp_lens.append(len(valid))
+                    solution_strs.append(
+                        self_rm.tokenizer.decode(valid, skip_special_tokens=True)
+                    )
+
+            rm_batch      = data.non_tensor_batch['reward_model']
+            ground_truths = [rm_batch[i]['ground_truth'] for i in range(n)]
+            ei_batch      = data.non_tensor_batch.get('extra_info')
+            extra_infos   = [ei_batch[i] for i in range(n)] if ei_batch is not None else [{} for _ in range(n)]
+
+            # One call — concurrent judge calls via batch_judge
+            scores = reward_fn(solution_strs, ground_truths, extra_infos)
+
+            # Place scalar reward at last valid token (veRL GRPO convention)
+            reward_tensor = torch.zeros_like(responses, dtype=torch.float32)
+            for i, (score, length) in enumerate(zip(scores, resp_lens)):
+                if length > 0:
+                    reward_tensor[i, length - 1] = float(score)
+
+            if return_dict:
+                return {'reward_tensor': reward_tensor}
+            return reward_tensor
+
+        _naive.NaiveRewardManager.__call__ = _batch_call
+        print('[reward] BatchRewardManager installed — judge calls now concurrent', flush=True)
+
+    except Exception as e:
+        print(f'[reward] BatchRewardManager install skipped ({e}), per-sample fallback active', flush=True)
+
+
+_install_batch_reward_manager()
+
+
+# ---------------------------------------------------------------------------
+# Per-sample fallback — loaded by name via custom_reward_function.name.
+# With BatchRewardManager active this is never called; it exists only so
+# veRL can find the symbol and construct NaiveRewardManager(compute_score).
 # ---------------------------------------------------------------------------
 
 def compute_score(
