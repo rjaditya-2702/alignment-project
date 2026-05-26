@@ -40,7 +40,7 @@ _KV  = re.compile(rf'([\w/]+):\s*({_NUM})')
 _STEP = re.compile(r'\bstep[:\s]+(\d+)', re.IGNORECASE)
 
 # Our eval line detector
-_EVAL = re.compile(r'^\[verl_eval\]\s+eval_pass:(\d+)\s+(.*)')
+_EVAL = re.compile(r'\[verl_eval\]\s+eval_pass:(\d+)\s+(.*)')
 
 
 def _extract_kv(text: str) -> dict:
@@ -61,7 +61,7 @@ def parse_log(log_file: str = "verl_training.log", output: str = "verl_metrics.c
             line = line.rstrip()
 
             # ── eval line ──────────────────────────────────────────────
-            m = _EVAL.match(line)
+            m = _EVAL.search(line)
             if m:
                 eval_pass = int(m.group(1))
                 metrics   = _extract_kv(m.group(2))

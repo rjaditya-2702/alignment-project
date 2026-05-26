@@ -23,7 +23,7 @@ CSV_FILE = sys.argv[1] if len(sys.argv) > 1 else "verl_metrics.csv"
 df = pd.read_csv(CSV_FILE)
 
 train_df = df[df["step"].notna()].copy()
-eval_df  = df[df["eval_pass"].notna()].copy()
+eval_df  = df[df["eval_pass"].notna()].copy() if "eval_pass" in df.columns else pd.DataFrame(columns=df.columns)
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -57,10 +57,10 @@ def _plot_grid(ax_data: list[tuple], x_col: str, xlabel: str, title: str, out: s
 # ── 1. Training metrics ────────────────────────────────────────────────────
 
 TRAIN_COLS = [
-    ("reward/mean",  "Reward / mean"),
-    ("actor/loss",   "Actor loss"),
-    ("critic/loss",  "Critic loss"),
-    ("kl",           "KL divergence"),
+    ("critic/rewards/mean", "Reward / mean"),
+    ("actor/pg_loss",       "Actor PG loss"),
+    ("actor/kl_loss",       "KL divergence"),
+    ("actor/entropy",       "Entropy"),
 ]
 
 if not train_df.empty:

@@ -38,7 +38,7 @@ from src.config import (TRAIN_DATA_SFT_LORA as TRAIN_DATA,
                         TRAIN_BATCH_SIZE)
 from src.data.preprocess import preprocess
 from src.training.tool_calling import library_fn
-from src.training.eval_metrics import RUNG_MAP, save_eval_plots
+from src.training.eval_metrics import compute_eval_metrics, save_eval_plots
 
 CLADDER_PROMPT = """You are given a scenario describing relationships between variables, along with numerical data and a question. Your task is to determine the answer by following these steps precisely.
 ---
@@ -236,6 +236,12 @@ CAUSCI_METHODS = {
     'did', 'rdd', 'iv', 'frontdoor', 'glm'
 }
 
+CLADDER_QUERY_TYPES_SFT = {                                                                                                                                                                          
+    'marginal', 'correlation', 'ate', 'backadj',                                                                                                                                              
+    'det-counterfactual', 'ett', 'nde', 'nie',                                                                                                                                                       
+    'collider_bias', 'exp_away'                                                                                                                                                               
+}  
+
 for d in [SFT_LORA_OUTPUT_DIR, SFT_LORA_PLOT_DIR, SFT_LORA_CHECKPOINT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -371,6 +377,43 @@ def extract_causci(model_output: str, dataset_columns: list[str]) -> dict | None
     }
 
 
+def extract_cladder_sft(output_text: str) -> dict | None:
+    """Parse step2 (query type) and step5 (yes/no) from a CLaDDer SFT response.
+
+    The model generates: <thinking content> </think> Yes/No
+    When decoded with skip_special_tokens=True, </think> may be stripped,
+    leaving the answer as the last word.
+    """
+    if '</think>' in output_text:
+        thinking, _, tail = output_text.partition('</think>')
+    else:
+        thinking = output_text
+        tail     = ""
+
+    # Final answer: first yes/no in tail, or last word of the full text
+    step5 = None
+    for tok in tail.strip().lower().split():
+        if tok.rstrip('.,!?') in ('yes', 'no'):
+            step5 = tok.rstrip('.,!?')
+            break
+    if step5 is None:
+        words = output_text.strip().lower().split()
+        if words and words[-1].rstrip('.,!?') in ('yes', 'no'):
+            step5 = words[-1].rstrip('.,!?')
+    if step5 is None:
+        return None
+
+    # Step 2: query type from "## Step 2: ..." section
+    step2 = None
+    m = re.search(r'##\s*Step\s*2[^\n]*\n([^\n#]+)', thinking, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip().lower()
+        if candidate in CLADDER_QUERY_TYPES_SFT:
+            step2 = candidate
+
+    return {'step5': step5, 'step2': step2}
+
+
 def reward_causci(prediction: dict, ground_truth: dict, library_effect: float) -> tuple[float, dict]:
     scores = {}
 
@@ -431,8 +474,7 @@ def build_sequence(prompt: str, thinking: str, answer: str, source: str = "cladd
         [prompt tokens] [<think> ... thinking ... </think>] [response] [<|im_end|>\n]
 
     Loss is applied ONLY to the response after </think> — thinking tokens carry zero loss:
-        cladder:     ANSWER_LAMBDA on the single answer token (yes/no)
-        causcibench: 1.0 on all JSON response tokens
+        both sources: 1.0 on all JSON response tokens
     If </think> is not found the sample is excluded from loss (mask stays all-zero).
     """
     system = (
@@ -574,8 +616,11 @@ def load_and_tokenize() -> tuple[SFTDataset, SFTDataset]:
     if not os.path.exists(TOKENIZED_CACHE):
         train_samples, test_samples = [], []
         for path, bucket in tqdm([(TRAIN_DATA, train_samples), (TEST_DATA, test_samples)]):
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 for line in tqdm(f):
+                    line = line.strip()
+                    if not line:
+                        continue
                     item   = json.loads(line)
                     source = item["source"]
                     gt     = item["groundtruth"]
@@ -584,7 +629,7 @@ def load_and_tokenize() -> tuple[SFTDataset, SFTDataset]:
                         seq = build_sequence(
                             prompt   = item["prompt"],
                             thinking = format_groundtruth(gt),
-                            answer   = item["label"],
+                            answer   = str(gt.get("step5", "")).strip(),
                             source   = "cladder",
                         )
                         seq["source"]          = "cladder"
@@ -641,159 +686,178 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
     torch.cuda.set_device(device)
     ddp_model.eval()
 
-    # CLaDDer tracking
-    cladder_by_rung    = {1: [], 2: [], 3: []}
-    cladder_cs         = []
-    cladder_non_cs     = []
-    cladder_all        = []
-    # CauSciBench tracking
-    causci_pending     = []
-    causci_method      = []
-    causci_treatment   = []
-    causci_outcome     = []
-    causci_effect      = []
-    causci_mres        = []
-    # Test loss tracking
-    test_loss_sum   = 0.0
-    test_loss_count = 0
-
-    yes_id = tokenizer.convert_tokens_to_ids("yes")
-    no_id  = tokenizer.convert_tokens_to_ids("no")
+    cladder_pending = []
+    causci_pending  = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            source = batch["source"][0]
-            gt     = batch["groundtruth"][0]
-
+            source         = batch["source"][0]
+            gt             = batch["groundtruth"][0]
+            prompt_len     = batch["prompt_lens"][0]
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            item = {
+                "prompt_ids":      input_ids[:, :prompt_len],
+                "prompt_attn":     attention_mask[:, :prompt_len],
+                "gt":              gt,
+                "csv_path":        batch["csv_path"][0],
+                "dataset_columns": batch["dataset_columns"][0],
+            }
             if source == "cladder":
-                input_ids      = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                loss_mask      = batch["loss_mask"][0]
+                cladder_pending.append(item)
+            else:
+                causci_pending.append(item)
 
-                answer_positions = (loss_mask == ANSWER_LAMBDA).nonzero(as_tuple=True)[0]
-                if len(answer_positions) == 0:
-                    continue
-                answer_pos = answer_positions[0].item()
+    def _batch_generate(pending, max_new_tokens, batch_size=8):
+        results = []
+        for i in range(0, len(pending), batch_size):
+            chunk    = pending[i : i + batch_size]
+            max_plen = max(p["prompt_ids"].shape[1] for p in chunk)
+            batch_ids  = torch.full((len(chunk), max_plen), tokenizer.pad_token_id, dtype=torch.long, device=device)
+            batch_attn = torch.zeros(len(chunk), max_plen, dtype=torch.long, device=device)
+            for j, p in enumerate(chunk):
+                plen = p["prompt_ids"].shape[1]
+                batch_ids[j, max_plen - plen:]  = p["prompt_ids"][0]
+                batch_attn[j, max_plen - plen:] = p["prompt_attn"][0]
+            with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=DTYPE):
+                generated = ddp_model.module.generate(
+                    input_ids=batch_ids,
+                    attention_mask=batch_attn,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            for j, p in enumerate(chunk):
+                text = tokenizer.decode(generated[j, max_plen:], skip_special_tokens=True)
+                results.append((text, p))
+        return results
 
-                with torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-                    outputs = ddp_model.module(input_ids=input_ids, attention_mask=attention_mask)
+    # Pearl's ladder of causation — mirrors eval_metrics.py
+    RUNG_MAP = {
+        "marginal": 1, "correlation": 1,
+        "ate": 2, "backadj": 2, "collider_bias": 2, "exp_away": 2, "ett": 2,
+        "det-counterfactual": 3, "nde": 3, "nie": 3,
+    }
 
-                loss_mask_dev = batch["loss_mask"].to(device)
-                batch_loss = compute_loss(outputs.logits, input_ids, loss_mask_dev)
-                test_loss_sum   += batch_loss.item()
-                test_loss_count += 1
+    # ── CLaDDer ────────────────────────────────────────────────────────────────
+    cladder_all    = []
+    cladder_step2  = []
+    by_rung        = {1: [], 2: [], 3: []}
+    by_cstype      = {"commonsensical": [], "nonsensical": [], "anti_commonsensical": []}
 
-                pred_id    = outputs.logits[0, answer_pos - 1, [yes_id, no_id]].argmax().item()
-                pred_label = "yes" if pred_id == 0 else "no"
-                true_label = tokenizer.decode(input_ids[0, answer_pos]).strip().lower()
-                correct    = int(pred_label == true_label)
+    cladder_results = _batch_generate(cladder_pending, max_new_tokens=TRAIN_MAX_TOKENS)
+    for k, (text, item) in enumerate(cladder_results):
+        if k == 0:
+            print(f"\n[eval cladder sample]\n{text}\n")
+        gt     = item["gt"]
+        parsed = extract_cladder_sft(text)
 
-                cladder_all.append(correct)
-                rung = RUNG_MAP.get(gt.get("step2", ""), 0)
-                if rung in cladder_by_rung:
-                    cladder_by_rung[rung].append(correct)
-                is_cs = gt.get("is_commonsense")
-                if is_cs is not None:
-                    (cladder_cs if is_cs else cladder_non_cs).append(correct)
+        pred5  = (parsed or {}).get("step5", "")
+        true5  = str(gt.get("step5", "")).strip().lower()
+        correct = int(pred5 == true5)
+        cladder_all.append(correct)
 
-            else:  # causcibench — collect for batched generation
-                prompt_len      = batch["prompt_lens"][0]
-                csv_path        = batch["csv_path"][0]
-                dataset_columns = batch["dataset_columns"][0]
-                input_ids       = batch["input_ids"].to(device)
-                attention_mask  = batch["attention_mask"].to(device)
-                causci_pending.append({
-                    "prompt_ids":      input_ids[:, :prompt_len],
-                    "prompt_attn":     attention_mask[:, :prompt_len],
-                    "prompt_len":      prompt_len,
-                    "csv_path":        csv_path,
-                    "dataset_columns": dataset_columns,
-                    "gt":              gt,
-                })
+        rung = RUNG_MAP.get(gt.get("step2", ""), 0)
+        if rung in by_rung:
+            by_rung[rung].append(correct)
 
-    # Batch-generate all causci samples
-    CAUSCI_GEN_BATCH = 8
-    for i in range(0, len(causci_pending), CAUSCI_GEN_BATCH):
-        chunk    = causci_pending[i : i + CAUSCI_GEN_BATCH]
-        max_plen = max(item["prompt_ids"].shape[1] for item in chunk)
+        # 3-way commonsense split (mirrors _commonsense_type in eval_metrics.py)
+        story_id = gt.get("story_id") or ""
+        is_cs    = gt.get("is_commonsense")
+        if story_id.startswith("nonsense"):
+            cstype = "nonsensical"
+        elif is_cs is False:
+            cstype = "anti_commonsensical"
+        elif is_cs is True:
+            cstype = "commonsensical"
+        else:
+            cstype = None
+        if cstype is not None:
+            by_cstype[cstype].append(correct)
 
-        batch_ids  = torch.full((len(chunk), max_plen), tokenizer.pad_token_id, dtype=torch.long, device=device)
-        batch_attn = torch.zeros(len(chunk), max_plen, dtype=torch.long, device=device)
-        for j, item in enumerate(chunk):
-            plen = item["prompt_ids"].shape[1]
-            batch_ids[j, max_plen - plen:]  = item["prompt_ids"][0]
-            batch_attn[j, max_plen - plen:] = item["prompt_attn"][0]
+        # Step 2 intermediate: query type accuracy
+        pred2 = (parsed or {}).get("step2")
+        if pred2 is not None:
+            cladder_step2.append(int(pred2 == gt.get("step2", "").strip().lower()))
 
-        with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=DTYPE):
-            generated = ddp_model.module.generate(
-                input_ids=batch_ids,
-                attention_mask=batch_attn,
-                max_new_tokens=512,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+    # ── CauSciBench ────────────────────────────────────────────────────────────
+    causci_method    = []
+    causci_treatment = []
+    causci_outcome   = []
+    causci_controls  = []
+    causci_effect    = []
+    causci_mres      = []
 
-        for j, item in enumerate(chunk):
-            output_text = tokenizer.decode(generated[j, max_plen:], skip_special_tokens=True)
-            if i == 0 and j == 0:
-                print(f"\n[eval sample response]\n{output_text}\n")
-            parsed      = extract_causci(output_text, item["dataset_columns"])
-            gt          = item["gt"]
-            csv_path    = item["csv_path"]
+    causci_results = _batch_generate(causci_pending, max_new_tokens=512)
+    for k, (text, item) in enumerate(causci_results):
+        if k == 0:
+            print(f"\n[eval causci sample]\n{text}\n")
+        gt       = item["gt"]
+        csv_path = item["csv_path"]
+        parsed   = extract_causci(text, item["dataset_columns"])
 
-            if parsed is None:
-                causci_method.append(0)
-                continue
+        if parsed is None:
+            causci_method.append(0)
+            continue
 
-            pred_method = parsed.get("step2", "").strip().lower()
-            gt_method   = (gt.get("step2") or "").strip().lower()
-            m_ok        = int(pred_method == gt_method)
-            causci_method.append(m_ok)
-            if not m_ok:
-                continue
+        pred_method = parsed.get("step2", "").strip().lower()
+        gt_method   = (gt.get("step2") or "").strip().lower()
+        m_ok        = int(pred_method == gt_method)
+        causci_method.append(m_ok)
+        if not m_ok:
+            continue
 
-            pred_s1 = parsed.get("step1") or {}
-            gt_s1   = gt.get("step1") or {}
+        pred_s1 = parsed.get("step1") or {}
+        gt_s1   = gt.get("step1") or {}
 
-            t_ok = int(pred_s1.get("treatment", "").strip() == str(gt_s1.get("treatment", "")).strip())
-            causci_treatment.append(t_ok)
-            o_ok = int(pred_s1.get("outcome", "").strip() == str(gt_s1.get("outcome", "")).strip())
-            causci_outcome.append(o_ok)
+        t_ok = int(pred_s1.get("treatment", "").strip() == str(gt_s1.get("treatment", "")).strip())
+        causci_treatment.append(t_ok)
+        o_ok = int(pred_s1.get("outcome", "").strip() == str(gt_s1.get("outcome", "")).strip())
+        causci_outcome.append(o_ok)
 
-            if t_ok and o_ok and csv_path:
-                parsed["step1"]["csv_path"] = csv_path
-                effect, _ = library_fn(parsed)
-                ref    = gt.get("step5")
-                if ref is not None and ref != 0:
-                    mre = abs(effect - ref) / abs(ref)
-                    causci_mres.append(mre)
-                    causci_effect.append(int(mre <= 0.05))
+        # Control coverage (Jaccard recall) — mirrors eval_metrics.py
+        pc = set(pred_s1.get("controls") or [])
+        rc = set(gt_s1.get("controls") or [])
+        if rc:
+            causci_controls.append(len(pc & rc) / len(rc))
+        else:
+            causci_controls.append(1.0 if not pc else 0.0)
 
+        if t_ok and o_ok and csv_path:
+            parsed["step1"]["csv_path"] = csv_path
+            effect, _ = library_fn(parsed)
+            ref = gt.get("step5")
+            if ref is not None and ref != 0:
+                mre = abs(effect - ref) / abs(ref)
+                causci_mres.append(mre)
+                causci_effect.append(int(mre <= 0.05))
+
+    # ── Aggregate ──────────────────────────────────────────────────────────────
     metrics = {}
 
     if cladder_all:
         metrics["cladder/overall_acc"] = sum(cladder_all) / len(cladder_all)
         for r in [1, 2, 3]:
-            if cladder_by_rung[r]:
-                metrics[f"cladder/rung{r}_acc"] = sum(cladder_by_rung[r]) / len(cladder_by_rung[r])
-        if cladder_cs:
-            metrics["cladder/commonsense_acc"]     = sum(cladder_cs)     / len(cladder_cs)
-        if cladder_non_cs:
-            metrics["cladder/non_commonsense_acc"] = sum(cladder_non_cs) / len(cladder_non_cs)
+            if by_rung[r]:
+                metrics[f"cladder/rung{r}_acc"] = sum(by_rung[r]) / len(by_rung[r])
+        for cstype, vals in by_cstype.items():
+            if vals:
+                metrics[f"cladder/{cstype}_acc"] = sum(vals) / len(vals)
+        if cladder_step2:
+            metrics["cladder/step2_acc"] = sum(cladder_step2) / len(cladder_step2)
 
     if causci_method:
-        metrics["causci/method_acc"]    = sum(causci_method)    / len(causci_method)
+        metrics["causci/method_acc"]   = sum(causci_method)   / len(causci_method)
     if causci_treatment:
         metrics["causci/treatment_acc"] = sum(causci_treatment) / len(causci_treatment)
     if causci_outcome:
-        metrics["causci/outcome_acc"]   = sum(causci_outcome)   / len(causci_outcome)
+        metrics["causci/outcome_acc"]  = sum(causci_outcome)  / len(causci_outcome)
+    if causci_controls:
+        metrics["causci/control_acc"]  = sum(causci_controls) / len(causci_controls)
     if causci_effect:
-        metrics["causci/effect_acc"]    = sum(causci_effect)    / len(causci_effect)
+        metrics["causci/effect_acc"]   = sum(causci_effect)   / len(causci_effect)
     if causci_mres:
-        metrics["causci/mre"]           = sum(causci_mres)      / len(causci_mres)
-
-    if test_loss_count > 0:
-        metrics["train/test_loss"] = test_loss_sum / test_loss_count
+        metrics["causci/mre"]          = sum(causci_mres)     / len(causci_mres)
 
     for k, v in sorted(metrics.items()):
         print(f"  {k}: {v:.4f}")

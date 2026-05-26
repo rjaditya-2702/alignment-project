@@ -25,7 +25,7 @@ For each problem the model produces 5 steps: (1) identify causal structure, (2) 
 | GPUs | Role |
 |------|------|
 | 0–2  | Policy model (training + vLLM rollout) |
-| 3    | Judge server (frozen vLLM/sglang inference) |
+| 3    | Judge server (frozen vLLM inference) |
 
 ---
 
@@ -89,22 +89,29 @@ src/output_RL/
 
 ---
 
-### 3. RL — GRPO via veRL (FSDP - InProgress)
+### 3. RL — GRPO via veRL (FSDP)
 
 **Script:** `src/training/verl_/data_process.py` (data prep) + `src/training/verl_/reward.py` (reward)
 **Run:** `sbatch run_verl.sh`
 
-Same GRPO algorithm as TRL but using veRL's FSDP backend instead of DDP, which gives higher throughput. Ray cluster on GPUs 0–2, judge server (sglang) on GPU 3.
+Same GRPO algorithm as TRL but using veRL's FSDP backend instead of DDP, which gives higher throughput. Ray cluster on GPUs 0–2, judge server (vLLM) on GPU 3.
 
 Data must be converted to Parquet first — `run_verl.sh` calls `data_process.py` automatically before starting training.
 
-**Eval during training:** reward-based validation every 100 steps (`trainer.test_freq=100`) using `compute_score` from `verl_/reward.py`.
+**Eval during training:** reward-based validation at an auto-computed interval (`TEST_FREQ = total_steps / 100`, minimum 150) using `compute_score` from `verl_/reward.py`.
+
+After training, `parse_verl_logs.py` converts `verl_training.log` → `verl_metrics.csv`. Run `python plot_verl.py verl_metrics.csv` locally to visualize.
 
 **Outputs:**
 ```
 src/output_RL/
   train.parquet / test.parquet — veRL parquet input files
-  verl_checkpoints/            — checkpoints saved every 500 steps
+  verl_checkpoints/            — checkpoints saved every 150 steps
+verl_training.log              — raw training log (tee'd output)
+verl_metrics.csv               — parsed metrics CSV for plotting
+verl_train_metrics.png         — reward/loss curves (local plotting)
+verl_eval_cladder.png          — CLadder eval breakdown
+verl_eval_causci.png           — CauSciBench eval breakdown
 ```
 
 ---
@@ -141,10 +148,16 @@ src/
     train_trl.py                   — GRPO training (TRL + vLLM colocate)
     tool_calling.py                — causal estimation library: loads CSV, runs OLS/IPW/
                                      matching/DiD/RDD/IV/frontdoor/GLM, returns effect float
+    eval_metrics.py                — compute CLadder & CauSciBench metrics, save plots
 
     verl_/
       data_process.py              — convert train/test JSONL to Parquet for veRL
       reward.py                    — reward function + extraction logic (veRL interface)
+      parse_verl_logs.py           — parse verl_training.log → verl_metrics.csv
+
+  eval/
+    eval_sft.py                    — offline evaluation for SFT checkpoint
+    eval_rl.py                     — offline evaluation for RL checkpoint
 
 dataset/
   train.jsonl                      — raw synthetic training examples
@@ -158,7 +171,8 @@ original_data/
 logs/                              — SLURM job logs
 run_sft_script.sh                  — SLURM: SFT training (4 GPUs, DDP)
 run_rl_script.sh                   — SLURM: TRL GRPO training (judge on GPU 3, policy on 0–2)
-run_verl.sh                        — SLURM: veRL GRPO training (judge sglang on GPU 3, Ray on 0–2)
+run_verl.sh                        — SLURM: veRL GRPO training (judge vLLM on GPU 3, Ray on 0–2)
+plot_verl.py                       — local: plot verl_metrics.csv → PNG charts
 ```
 
 ---
@@ -200,12 +214,96 @@ sbatch run_verl.sh
 ```
 
 1. Runs `data_process.py` to convert JSONL → Parquet (includes preprocessing with veRL prompts)
-2. Starts judge server (sglang) on GPU 3
+2. Starts judge server (vLLM) on GPU 3
 3. Starts Ray cluster on GPUs 0–2
 4. Runs `verl.trainer.main_ppo` with GRPO config
 
 Checkpoints → `src/output_RL/verl_checkpoints/`
-Eval metric → mean reward on validation parquet, logged every 100 steps.
+Eval metric → mean reward on validation parquet, logged at auto-computed interval.
+
+After the job completes, copy `verl_metrics.csv` locally and run:
+```bash
+python plot_verl.py verl_metrics.csv
+```
+
+---
+
+## Reward Function
+
+Both TRL and veRL use the same scoring logic. Parse failure always returns **−1.0** for either benchmark.
+
+### CLadder — cascade gates
+
+Each gate short-circuits scoring if the model gets that step wrong.
+
+| Step | Check | Pass | Fail |
+|------|-------|------|------|
+| step1 | Judge scores causal graph (0/1) | continue | **−1.0** (stop) |
+| step2 | Exact match on query type | continue | **−0.5** (stop) |
+| step3 | Judge scores estimand (0/1) | 0 penalty | **−0.25** penalty (continue) |
+| step5 | Exact match on yes/no answer | **+1.0** + step3 penalty | **−0.75** + step3 penalty |
+
+Range: [−1.25, +1.0]. The step3 judge is only called when step2 matches.
+
+### CauSciBench — weighted combination
+
+No gates. All components scored independently, then combined:
+
+| Component | Weight | Scoring |
+|-----------|--------|---------|
+| method (step2) | 30% | exact match → 0 or 1 |
+| treatment | 15% | exact match → 0 or 1 |
+| outcome | 10% | exact match → 0 or 1 |
+| controls | 15% | Jaccard recall vs. ground truth → [0, 1] |
+| effect | 30% | MRE ≤ 5% vs. reference → 0 or 1 |
+
+`reward = (weighted_sum) × 2 − 1` — rescales [0, 1] → [−1, +1].
+
+`library_fn` (the causal estimator) is only called when the predicted method matches the ground truth. If method is wrong, effect score is 0.
+
+---
+
+## Metric Logging and Parsing (veRL)
+
+### During training
+
+veRL's native console output emits one line per training step:
+```
+step: 42  actor/loss: 0.312  kl: 0.008  reward/mean: -0.241 ...
+```
+
+`reward_fn` also prints a line per batch call:
+```
+[verl] call   123  reward=-0.241  src=cladder
+```
+
+### During eval (test split)
+
+`reward_fn` detects `split == "test"` from `extra_info`. Rewards are still computed and returned to veRL (for its own validation reporting), but each batch's parsed outputs are also accumulated in an in-process buffer. An intermediate line is printed per eval batch:
+```
+[verl_eval] eval_pass:0 call:  456 reward=+0.312 src=causcibench
+```
+
+When the next **training** batch arrives (split switches back to "train"), the buffer is flushed: `compute_eval_metrics()` runs over all accumulated test samples and prints one summary line:
+```
+[verl_eval] eval_pass:1 cladder/overall_acc:0.5100 cladder/rung1:0.6200 causci/method_acc:0.4800 ...
+```
+The buffer is then cleared. An `atexit` handler fires the same flush if training ends immediately after an eval pass.
+
+### parse_verl_logs.py
+
+Reads `verl_training.log` and separates two line types:
+
+| Line type | Pattern | Output row |
+|-----------|---------|------------|
+| veRL native step | `step: N …key:value…` | `step` + metric columns |
+| Eval summary | `[verl_eval] eval_pass:N …key:value…` | `eval_pass` + metric columns |
+
+Both are written to one CSV (missing columns are NaN). Run locally:
+```bash
+python3 src/training/verl_/parse_verl_logs.py verl_training.log verl_metrics.csv
+python plot_verl.py verl_metrics.csv
+```
 
 ---
 
@@ -236,8 +334,8 @@ Key settings:
 |-----------|-------|-------------|
 | `POLICY_MODEL` | `Qwen/Qwen3-8B` | Base model |
 | `JUDGE_MODEL` | `Qwen/Qwen3-8B` | Judge for CLadder scoring |
-| `N_ROLLOUTS` | 6 | Completions per prompt (RL) |
-| `TRAIN_BATCH_SIZE` | 2 | Prompts per training step |
+| `N_ROLLOUTS` | 3 | Completions per prompt (RL) |
+| `TRAIN_BATCH_SIZE` | 1 | Prompts per training step |
 | `LORA_R` | 16 | LoRA rank (RL); 32 for SFT |
 | `BETA` | 0.01 | KL penalty coefficient |
 | `LR` | 2e-5 | Learning rate |

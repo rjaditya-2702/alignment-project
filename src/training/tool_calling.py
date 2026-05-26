@@ -229,6 +229,8 @@ def run_did(df, treatment, outcome, time_variable, group_variable, controls=None
     else:
         # TWFE — staggered treatment
         df = df.dropna(subset=[treatment, outcome, group_variable, time_variable] + (controls or []))
+        controls = [c for c in (controls or []) if c != treatment]
+        controls = list(dict.fromkeys(controls))  # dedupe, preserve order
         if len(df) < 2:
             return _result(0.0, 0.0)
         df["unit_id"] = pd.Categorical(df[group_variable]).codes
@@ -466,9 +468,13 @@ def library_fn(parsed_prediction: dict) -> (float, bool):
         )
 
     elif method == "rdd":
+        try:
+            cutoff = float(s1["cutoff"])
+        except (ValueError, TypeError):
+            return 0.0, False
         result = run_rdd(
             df, treatment, outcome,
-            _sanitize_col(s1["running_variable"]), float(s1["cutoff"]), controls
+            _sanitize_col(s1["running_variable"]), cutoff, controls
         )
 
     elif method == "iv":

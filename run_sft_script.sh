@@ -1,15 +1,14 @@
 #!/bin/bash
 #SBATCH --account=a0107
 #SBATCH --job-name=cai_sft_training
-#SBTACH --output=/iopsstor/scratch/cscs/ajannali/project/sft_runs/result_%j.out
+#SBATCH --output=/iopsstor/scratch/cscs/ajannali/project/sft_runs/result_%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/ajannali/project/sft_runs/results_%j.err
 #SBATCH --nodes=1
 #SBATCH --gpus=4
 #SBATCH --partition=normal
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 #SBATCH --uenv=pytorch/v2.9.1:v2
 #SBATCH --view=default
-#SBATCH --time=06:00:00
 
 # uenv image pull pytorch/v2.9.1:v2
 uenv start pytorch/v2.9.1:v2 --view=default

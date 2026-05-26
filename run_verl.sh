@@ -10,7 +10,19 @@
 #SBATCH --environment=/iopsstor/scratch/cscs/ajannali/project/env_toml.toml
 
 cd /iopsstor/scratch/cscs/ajannali/project/causal_alignment
-rm -rf verl_training.log verl_metrics.csv src/output_RL/verl_checkpoints/*
+
+# Set RESUME=true to resume from the latest checkpoint instead of starting fresh.
+RESUME=true
+
+rm -rf judge_server.log
+rm -rf /iopsstor/scratch/cscs/ajannali/project/verl_runs
+rm -rf /iopsstor/scratch/cscs/ajannali/project/causal_alignment/core_nid*
+
+if [ "$RESUME" = "false" ]; then
+    rm -rf /iopsstor/scratch/cscs/ajannali/project/causal_alignment/verl_training.log
+    rm -rf /iopsstor/scratch/cscs/ajannali/project/causal_alignment/verl_metrics.csv
+    rm -rf $SCRATCH/project/causal_alignment/src/output_RL/verl_checkpoints/*
+fi
 
 pip install --user \
   "transformers==4.55.4" \
@@ -95,8 +107,11 @@ print(len(df))
 ")
 TOTAL_STEPS=$(( 3 * TRAIN_SIZE / 20 ))
 TEST_FREQ=$(( TOTAL_STEPS / 100 ))
-[ "$TEST_FREQ" -lt 1 ] && TEST_FREQ=1
+[ "$TEST_FREQ" -lt 1 ] && TEST_FREQ=150
 echo "TEST_FREQ=$TEST_FREQ  (train_size=$TRAIN_SIZE, total_steps=$TOTAL_STEPS)"
+
+RESUME_ARG=""
+[ "$RESUME" = "true" ] && RESUME_ARG="trainer.resume_mode=auto"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -109,6 +124,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=2000 \
     data.truncation=left \
     data.dataloader_num_workers=0 \
+    data.shuffle=True \
     \
     actor_rollout_ref.model.path=Qwen/Qwen3-8B \
     actor_rollout_ref.model.enable_gradient_checkpointing=False \
@@ -117,7 +133,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.target_modules=all-linear \
     +actor_rollout_ref.model.override_config.torch_dtype=bfloat16 \
     ++actor_rollout_ref.model.use_remove_padding=True \
-    +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
+    +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_3 \
     \
     actor_rollout_ref.actor.optim.lr=2e-5 \
     actor_rollout_ref.actor.optim.weight_decay=0.01 \
@@ -152,12 +168,13 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.name=compute_score \
     \
     trainer.critic_warmup=0 \
+    $RESUME_ARG \
     trainer.logger='["console", "file"]' \
     trainer.project_name=causal_alignment \
     trainer.experiment_name=qwen3_8b_grpo \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=150 \
+    trainer.save_freq=50 \
     trainer.test_freq=$TEST_FREQ \
     trainer.total_epochs=3 \
     trainer.default_local_dir=$SCRATCH/project/causal_alignment/src/output_RL/verl_checkpoints \
