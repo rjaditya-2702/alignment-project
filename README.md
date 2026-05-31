@@ -340,3 +340,9 @@ Key settings:
 | `BETA` | 0.01 | KL penalty coefficient |
 | `LR` | 2e-5 | Learning rate |
 | `EVAL_MAX_TOKENS` | 4096 | Max tokens during eval generation |
+
+---
+
+## Results
+
+The plots are available in `./interation_*` directories. 

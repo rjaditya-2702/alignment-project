@@ -2,6 +2,7 @@ import json
 import pandas as pd
 import sys
 from pathlib import Path
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3] # verl_ -> training -> src -> project root
 sys.path.insert(0, str(PROJECT_ROOT)) # allow imports from project root
@@ -61,6 +62,8 @@ Step 3 — Estimand: Write the mathematical expression for the query. Apply back
 
 Step 4 — Compute: Substitute every numeric value from the scenario into the estimand. Show each arithmetic step explicitly. End with the final number. For backadj / collider_bias / exp_away, trace the graph paths and state your conclusion.
 
+Step 5 - Answer: Based on the above inference performed and the question asked in the scenario, answer yes or no.
+
 Then output this JSON and nothing else:
 
 {{
@@ -102,31 +105,18 @@ Low-cardinality columns (≤10 unique values):
 
 ## Method Reference
 
-| Method | Use when |
-|--------|----------|
-| diff_in_means | RCT with enforced compliance. Groups comparable by design. No confounding. |
-| ols | Observational. All confounders observed and included. No unobserved confounding. |
-| ipw | Observational. Confounders observed. Reweight by propensity score. Needs overlap: 0 < e(X) < 1. |
-| matching | Observational. Confounders observed. Use when propensity score overlap is poor. |
-| did | Panel data. Treatment introduced at one point in time to one group. Time variable must be treatment timing, not a covariate. Parallel trends must hold. |
-| rdd | Treatment assigned by a running variable crossing a known cutoff. Units just above and below cutoff are comparable. |
-| iv | Unobserved confounders exist. Valid instrument available — correlated with treatment, affects outcome only through treatment. |
-| frontdoor | Unobserved confounders exist. Full mediator pathway T→M→Y with no unobserved T→M or M→Y confounding. |
-| glm | Binary outcome (logistic) or count outcome (Poisson). Confounders observed. |
-
-## Estimand Reference
-
-| Method | Estimand |
-|--------|----------|
-| diff_in_means | ATE |
-| ols | ATE |
-| ipw | ATE, ATT, or ATC — based on whether question asks about population, treated group, or control group |
-| matching | ATE or ATT |
-| did | ATT |
-| rdd | Local ATE at the cutoff |
-| iv | LATE |
-| frontdoor | ATE |
-| glm | Conditional effect (log-odds for binary, incidence rate ratio for counts) |
+| Method | Estimand | Use when |
+|--------|----------|----------|
+| diff_in_means | ATE | RCT with enforced compliance. Groups comparable by design. No confounding. |
+| ols | ATE | Observational. All confounders observed and included. No unobserved confounding. |
+| ipw | ATE, ATT, or ATC — based on whether question asks about population, treated group, or control group | Observational. Confounders observed. Reweight by propensity score. Needs overlap: 0 < e(X) < 1. |
+| matching | ATE, ATT, or ATC  | Observational. Confounders observed. Use when propensity score overlap is poor. |
+| did | ATT | Panel data. Treatment introduced at one point in time to one group. Time variable must be treatment timing, not a covariate. Parallel trends must hold. |
+| rdd | Local ATE at the cutoff | Treatment assigned by a running variable crossing a known cutoff. Units just above and below cutoff are comparable. |
+| iv | LATE | Unobserved confounders exist. Valid instrument available — correlated with treatment, affects outcome only through treatment. |
+| frontdoor | ATE | Unobserved confounders exist. Full mediator pathway T→M→Y with no unobserved T→M or M→Y confounding. |
+| backdoor  | ATE | Observational. All confounders observed. Use regression (ols/glm) or other adjustment to block backdoor paths. |
+| glm | Conditional effect (log-odds for binary, incidence rate ratio for counts) | Binary outcome (logistic) or count outcome (Poisson). Confounders observed. |
 
 ---
 
@@ -139,35 +129,32 @@ Think through the following before answering:
 - Is the outcome binary, count, or continuous?
 - Does the question ask about the full population (ATE), treated units (ATT), or local effect (LATE)?
 
-Then output this JSON and nothing else after your thinking:
+Then output this JSON and nothing else after your thinking. Use `null` only when the field is truly not applicable.
 
 {{
   "step1": {{
     "treatment": "<exact column name>",
     "outcome": "<exact column name>",
-    "controls": ["<col1>", "<col2>"],
-    "instrument": null,
-    "running_variable": null,
-    "cutoff": null,
-    "time_variable": null,
-    "group_variable": null,
-    "mediator": null,
+    "controls": ["<list of exact column names>"],
+    "instrument": "<exact column name if step2 is 'iv', else null>",
+    "running_variable": "<exact column name if step2 is 'rdd', else null>",
+    "cutoff": "<numeric threshold value if step2 is 'rdd', else null>",
+    "time_variable": "<exact column name if step2 is 'did', else null>",
+    "group_variable": "<exact column name if step2 is 'did', else null>",
+    "mediator": "<exact column name if step2 is 'frontdoor', else null>",
     "estimand": "<ATE, ATT, ATC, LATE, or conditional>"
   }},
-  "step2": "<method name>"
+  "step2": "<method name - one of: diff_in_means, ols, propensity_score, ipw, matching, did, rdd, iv, backdoor, frontdoor, glm >"
 }}
 """
 
 
 # Add these imports at top
 
-CAUSCI_SYSTEM_PROMPT = """You are a causal inference expert. Analyze the study design carefully 
-before selecting variables and methods. Think through your reasoning, 
-then output only the JSON.
+CAUSCI_SYSTEM_PROMPT = """You are a causal inference expert. Analyze the study design carefully before selecting variables and methods. Think through your reasoning, then output only the JSON.
 """
 
-CLADDER_SYSTEM_PROMPT = """You are a causal inference expert. Think step by step inside <think> tags, 
-then output a JSON object and no other text. No explanations, no leading or tailing sentences. Just answer with the JSON object. 
+CLADDER_SYSTEM_PROMPT = """You are a causal inference expert. Analyze the study design carefully before selecting variables and methods. Think through your reasoning, then output only the JSON.
 """
 
 def _build_messages(row: dict) -> list[dict]:
@@ -175,7 +162,7 @@ def _build_messages(row: dict) -> list[dict]:
     return [
         {"role": "system",    "content": system},
         {"role": "user",      "content": row["prompt"]},
-        {"role": "assistant", "content": "<think>"},
+        # {"role": "assistant", "content": "<think>"},
     ]
 
 def _resolve_csv_path(stored: str) -> str:
@@ -246,7 +233,7 @@ def _convert_split(jsonl_path: Path, parquet_path: Path, split: str, limit: int 
     records = []
     skipped = 0
 
-    for row in rows:
+    for row in tqdm(rows):
         try:
             records.append({
                 "prompt":       _build_messages(row),

@@ -43,6 +43,10 @@ _eval_pass    = [0]  # number of eval passes completed
 _judge_client = OpenAI(base_url="http://localhost:8001/v1", api_key="token")
 JUDGE_MODEL   = "Qwen/Qwen3-8B"  # must match what the judge server is serving
 
+def _sanitize_col(name: str) -> str:
+    """Replace characters patsy treats as operators (dots, spaces, hyphens) with underscores."""
+    return re.sub(r'[.\s\-]', '_', str(name))
+
 def _judge_one(prompt: str) -> float:
     try:
         r = _judge_client.chat.completions.create(
@@ -109,34 +113,60 @@ def reward_cladder_precomputed(
     s1_score: int,
     s3_score: int | None,
 ) -> tuple[float, dict]:
+    
     scores = {}
-
-    scores['step1'] = s1_score
-    if scores['step1'] == 0:
-        return -1.0, scores
-
-    pred_step2 = prediction.get('step2', '').strip().lower()
-    ref_step2  = ground_truth.get('step2', '').strip().lower()
-    scores['step2'] = 1 if pred_step2 == ref_step2 else 0
-
-    if scores['step2'] == 0:
-        scores['step3'] = 0
-        scores['step5'] = 0
-        return -0.5, scores
-
-    scores['step3']  = s3_score if s3_score is not None else 0
-    step3_penalty    = 0.0 if scores['step3'] == 1 else -0.25
-
-    pred_step5 = prediction.get('step5', '').strip().lower()
-    ref_step5  = ground_truth.get('step5', '').strip().lower()
-    scores['step5'] = 1 if pred_step5 == ref_step5 else 0
-
-    if scores['step5'] == 1:
-        reward = 1.0 + step3_penalty
-    else:
-        reward = -0.75 + step3_penalty
-
+    
+    scores['step1'] = s1_score  # 0 or 1
+    scores['step2'] = 1 if prediction.get('step2','').strip().lower() == ground_truth.get('step2','').strip().lower() else 0
+    scores['step3'] = s3_score if s3_score is not None else 0
+    scores['step5'] = 1 if prediction.get('step5','').strip().lower() == ground_truth.get('step5','').strip().lower() else 0
+    
+    # weighted additive — always produces variance across rollouts
+    reward = (
+        0.15 * scores['step1'] +
+        0.25 * scores['step2'] +
+        0.10 * scores['step3'] +
+        0.50 * scores['step5']
+    )
+    # shift to [-1, +1]
+    reward = 2 * reward - 1
+    
     return reward, scores
+
+# def reward_cladder_precomputed(
+#     prediction: dict,
+#     ground_truth: dict,
+#     s1_score: int,
+#     s3_score: int | None,
+# ) -> tuple[float, dict]:
+#     scores = {}
+
+#     scores['step1'] = s1_score
+#     if scores['step1'] == 0:
+#         return -1.0, scores
+
+#     pred_step2 = prediction.get('step2', '').strip().lower()
+#     ref_step2  = ground_truth.get('step2', '').strip().lower()
+#     scores['step2'] = 1 if pred_step2 == ref_step2 else 0
+
+#     if scores['step2'] == 0:
+#         scores['step3'] = 0
+#         scores['step5'] = 0
+#         return -0.5, scores
+
+#     scores['step3']  = s3_score if s3_score is not None else 0
+#     step3_penalty    = 0.0 if scores['step3'] == 1 else -0.25
+
+#     pred_step5 = prediction.get('step5', '').strip().lower()
+#     ref_step5  = ground_truth.get('step5', '').strip().lower()
+#     scores['step5'] = 1 if pred_step5 == ref_step5 else 0
+
+#     if scores['step5'] == 1:
+#         reward = 1.0 + step3_penalty
+#     else:
+#         reward = -0.75 + step3_penalty
+
+#     return reward, scores
 
 def reward_causci(prediction, ground_truth, library_effect, library_success):
     scores = {}
@@ -173,8 +203,8 @@ def reward_causci(prediction, ground_truth, library_effect, library_success):
     ground_truth_step1 = ground_truth.get('step1', {})
     if ground_truth_step1 is None:
         ground_truth_step1 = {}
-    pc = {c.strip().lower() for c in (prediction_step1.get('controls') or [])}
-    rc = {c.strip().lower() for c in (ground_truth_step1.get('controls') or [])}
+    pc = {_sanitize_col(c.strip().lower()) for c in (prediction_step1.get('controls') or [])}
+    rc = {_sanitize_col(c.strip().lower()) for c in (ground_truth_step1.get('controls') or [])}
     if rc:
         scores['controls'] = len(pc & rc) / len(rc)
     else:
@@ -310,7 +340,11 @@ def extract_cladder(model_output: str) -> dict | None:
     step2 = parsed.get('step2', '').strip().lower()
     if step2 not in CLADDER_QUERY_TYPES:
         return None
-    step5 = parsed.get('step5', '').strip().lower()
+    step5 = parsed.get('step5', '')
+    if isinstance(step5, (int, float)):
+        step5 = 'yes' if abs(step5) > 0 else 'no'
+    else:
+        step5 = step5.strip().lower()
     if step5 not in {'yes', 'no'}:
         return None
     return {
@@ -334,8 +368,13 @@ def extract_causci(model_output: str, dataset_columns: list[str]) -> dict | None
     if method not in CAUSCI_METHODS:
         return None
 
-    treatment = (step1.get('treatment') or '').strip()
-    outcome   = (step1.get('outcome') or '').strip()
+    def _str_field(val):
+        if isinstance(val, list):
+            val = val[0] if val else ''
+        return (val or '').strip()
+
+    treatment = _str_field(step1.get('treatment'))
+    outcome   = _str_field(step1.get('outcome'))
     if treatment not in dataset_columns:
         return None
     if outcome not in dataset_columns:
@@ -344,20 +383,20 @@ def extract_causci(model_output: str, dataset_columns: list[str]) -> dict | None
     controls = [c for c in (step1.get('controls') or []) if c in dataset_columns]
 
     if method == 'iv':
-        if step1.get('instrument') not in dataset_columns:
+        if _str_field(step1.get('instrument')) not in dataset_columns:
             return None
     if method == 'rdd':
-        if step1.get('running_variable') not in dataset_columns:
+        if _str_field(step1.get('running_variable')) not in dataset_columns:
             return None
         if step1.get('cutoff') is None:
             return None
     if method == 'did':
-        if step1.get('time_variable') not in dataset_columns:
+        if _str_field(step1.get('time_variable')) not in dataset_columns:
             return None
-        if step1.get('group_variable') not in dataset_columns:
+        if _str_field(step1.get('group_variable')) not in dataset_columns:
             return None
     if method == 'frontdoor':
-        if step1.get('mediator') not in dataset_columns:
+        if _str_field(step1.get('mediator')) not in dataset_columns:
             return None
 
     return {
@@ -365,13 +404,13 @@ def extract_causci(model_output: str, dataset_columns: list[str]) -> dict | None
             'treatment':        treatment,
             'outcome':          outcome,
             'controls':         controls,
-            'instrument':       step1.get('instrument'),
-            'running_variable': step1.get('running_variable'),
+            'instrument':       _str_field(step1.get('instrument')),
+            'running_variable': _str_field(step1.get('running_variable')),
             'cutoff':           step1.get('cutoff'),
-            'time_variable':    step1.get('time_variable'),
-            'group_variable':   step1.get('group_variable'),
-            'mediator':         step1.get('mediator'),
-            'estimand':         (step1.get('estimand') or '').strip().lower(),
+            'time_variable':    _str_field(step1.get('time_variable')),
+            'group_variable':   _str_field(step1.get('group_variable')),
+            'mediator':         _str_field(step1.get('mediator')),
+            'estimand':         _str_field(step1.get('estimand')).lower(),
         },
         'step2': method,
     }

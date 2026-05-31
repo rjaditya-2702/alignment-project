@@ -170,14 +170,42 @@ def run_matching(df, treatment, outcome, controls=None, estimand="ATT"):
 
     if estimand == "ATT":
         tau = np.mean(Y[treated_idx] - Y[matched_control_idx])
-    else:  # ATE — match both ways
+    elif estimand == "ATC":
+        # Match control units to treated
         nn2 = NearestNeighbors(n_neighbors=1)
         nn2.fit(ps[treated_idx])
+
         _, indices2 = nn2.kneighbors(ps[control_idx])
         matched_treated_idx = treated_idx[indices2.flatten()]
+
+        tau = np.mean(Y[matched_treated_idx] - Y[control_idx])
+
+    else:  # ATE
+        # ATT component
         att = np.mean(Y[treated_idx] - Y[matched_control_idx])
+
+        # ATC component
+        nn2 = NearestNeighbors(n_neighbors=1)
+        nn2.fit(ps[treated_idx])
+
+        _, indices2 = nn2.kneighbors(ps[control_idx])
+        matched_treated_idx = treated_idx[indices2.flatten()]
+
         atc = np.mean(Y[matched_treated_idx] - Y[control_idx])
-        tau = (len(treated_idx) * att + len(control_idx) * atc) / len(T)
+
+        # Weighted average
+        tau = (
+            len(treated_idx) * att +
+            len(control_idx) * atc
+        ) / len(T)
+    # elif estimand == "ATE":  # ATE
+    #     nn2 = NearestNeighbors(n_neighbors=1)
+    #     nn2.fit(ps[treated_idx])
+    #     _, indices2 = nn2.kneighbors(ps[control_idx])
+    #     matched_treated_idx = treated_idx[indices2.flatten()]
+    #     att = np.mean(Y[treated_idx] - Y[matched_control_idx])
+    #     atc = np.mean(Y[matched_treated_idx] - Y[control_idx])
+    #     tau = (len(treated_idx) * att + len(control_idx) * atc) / len(T)
 
     # bootstrap SE
     n_boot = 200
@@ -380,6 +408,7 @@ def run_frontdoor(df, treatment, outcome, mediator, controls=None):
 # ------------------------------------------------------------------
 # 9. glm
 # ------------------------------------------------------------------
+
 def run_glm(df, treatment, outcome, controls=None):
     df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
     if len(df) < 2:
@@ -417,6 +446,102 @@ def run_glm(df, treatment, outcome, controls=None):
     se   = model.bse[treatment]
     return _result(coef, se)
 
+# ------------------------------------------------------------------
+# 10. backdoor
+# ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# 10. backdoor (g-computation / standardization)
+# ------------------------------------------------------------------
+def run_backdoor(df, treatment, outcome, controls=None, estimand="ATE"):
+    """
+    Backdoor adjustment via g-computation (standardization).
+
+    Given a sufficient adjustment set Z (the `controls`), estimate:
+        E[Y | do(T=t)] = E_Z[ E[Y | T=t, Z] ]
+
+    ATE = E[Y | do(T=1)] - E[Y | do(T=0)]
+    ATT = E[Y | do(T=1), T=1] - E[Y | do(T=0), T=1]
+    ATC = E[Y | do(T=1), T=0] - E[Y | do(T=0), T=0]
+
+    The adjustment set is assumed valid (LLM-specified via `controls`).
+    Estimation uses a flexible outcome regression with T:Z interactions
+    so the conditional outcome surface can vary across treatment arms.
+    """
+    df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
+    if len(df) < 2 or df[treatment].nunique() < 2:
+        return _result(0.0, 0.0)
+
+    # Detect outcome type for the outcome model
+    unique_vals = df[outcome].dropna().unique()
+    is_binary_outcome = set(unique_vals).issubset({0, 1, 0.0, 1.0}) and len(unique_vals) >= 2
+
+    # Build outcome model: Y ~ T + Z + T:Z   (interactions let CATE vary in Z)
+    if controls:
+        interaction_terms = " + ".join([f"{treatment}:{c}" for c in controls])
+        rhs = f"{treatment} + {' + '.join(controls)} + {interaction_terms}"
+    else:
+        rhs = treatment
+    formula = f"{outcome} ~ {rhs}"
+
+    def _g_compute(data):
+        # Fit outcome model
+        try:
+            if is_binary_outcome:
+                model = smf.logit(formula, data=data).fit(disp=False)
+            else:
+                model = smf.ols(formula, data=data).fit()
+        except (np.linalg.LinAlgError, ValueError):
+            # fall back to additive (no interactions) on rank failure
+            rhs_fallback = _formula(outcome, treatment, controls)
+            try:
+                if is_binary_outcome:
+                    model = smf.logit(rhs_fallback, data=data).fit(disp=False)
+                else:
+                    model = smf.ols(rhs_fallback, data=data).fit()
+            except (np.linalg.LinAlgError, ValueError):
+                return None
+
+        # Choose the population to standardize over based on estimand
+        if estimand == "ATT":
+            pop = data[data[treatment] == 1]
+        elif estimand == "ATC":
+            pop = data[data[treatment] == 0]
+        else:  # ATE
+            pop = data
+
+        if len(pop) == 0:
+            return None
+
+        # Counterfactual predictions: set T=1 for everyone, then T=0 for everyone
+        pop_t1 = pop.assign(**{treatment: 1})
+        pop_t0 = pop.assign(**{treatment: 0})
+
+        try:
+            y1 = model.predict(pop_t1)
+            y0 = model.predict(pop_t0)
+        except Exception:
+            return None
+
+        return float(np.mean(y1 - y0))
+
+    tau = _g_compute(df)
+    if tau is None:
+        return _result(0.0, 0.0)
+
+    # Bootstrap SE
+    n_boot = 200
+    boot_taus = []
+    rng = np.random.default_rng(42)
+    for _ in range(n_boot):
+        idx = rng.integers(0, len(df), len(df))
+        boot_df = df.iloc[idx].reset_index(drop=True)
+        b = _g_compute(boot_df)
+        if b is not None and np.isfinite(b):
+            boot_taus.append(b)
+    se = float(np.std(boot_taus)) if boot_taus else 0.0
+
+    return _result(tau, se)
 
 # ------------------------------------------------------------------
 # Dispatcher
@@ -430,6 +555,7 @@ ESTIMATORS = {
     "rdd":           run_rdd,
     "iv":            run_iv,
     "frontdoor":     run_frontdoor,
+    "backdoor":      run_backdoor,
     "glm":           run_glm,
 }
 
@@ -482,6 +608,10 @@ def library_fn(parsed_prediction: dict) -> (float, bool):
 
     elif method == "frontdoor":
         result = run_frontdoor(df, treatment, outcome, _sanitize_col(s1["mediator"]), controls)
+
+    elif method == "backdoor":
+        estimand = s1.get("estimand", "ATE").upper()
+        result = run_backdoor(df, treatment, outcome, controls, estimand)
 
     else:
         return 0.0, False

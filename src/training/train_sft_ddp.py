@@ -261,6 +261,7 @@ LORA_ALPHA         = 64
 LORA_DROPOUT       = 0.05
 ANSWER_LAMBDA      = 5.0
 DTYPE              = torch.bfloat16
+EVAL_EVERY         = 100
 
 # ── Tokenizer ──────────────────────────────────────────────────────────────────
 tokenizer = AutoTokenizer.from_pretrained(POLICY_MODEL)
@@ -486,7 +487,7 @@ def build_sequence(prompt: str, thinking: str, answer: str, source: str = "cladd
     messages = [
         {"role": "system", "content": system},
         {"role": "user",   "content": prompt},
-        {"role": "assistant", "content": "<think>"}
+        # {"role": "assistant", "content": "<think>"}
     ]
 
     prompt_text = tokenizer.apply_chat_template(
@@ -496,7 +497,7 @@ def build_sequence(prompt: str, thinking: str, answer: str, source: str = "cladd
         enable_thinking=True,
     )
 
-    response_text = thinking + "\n</think>" + answer + "<|im_end|>\n"
+    response_text = "<think>\n" + thinking + "\n</think>" + answer + "<|im_end|>"
     full_text     = prompt_text + response_text
 
     full_ids = tokenizer(
@@ -710,7 +711,8 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
 
     def _batch_generate(pending, max_new_tokens, batch_size=8):
         results = []
-        for i in range(0, len(pending), batch_size):
+        intermediate_generations = []
+        for i in tqdm(range(0, len(pending), batch_size), desc="Batch Generating"):
             chunk    = pending[i : i + batch_size]
             max_plen = max(p["prompt_ids"].shape[1] for p in chunk)
             batch_ids  = torch.full((len(chunk), max_plen), tokenizer.pad_token_id, dtype=torch.long, device=device)
@@ -727,9 +729,12 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
                     do_sample=False,
                     pad_token_id=tokenizer.pad_token_id,
                 )
+                intermediate_generations.append((generated, chunk, max_plen))
+        for generated, chunk, max_plen in intermediate_generations:
             for j, p in enumerate(chunk):
                 text = tokenizer.decode(generated[j, max_plen:], skip_special_tokens=True)
                 results.append((text, p))
+        del intermediate_generations
         return results
 
     # Pearl's ladder of causation — mirrors eval_metrics.py
@@ -745,8 +750,9 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
     by_rung        = {1: [], 2: [], 3: []}
     by_cstype      = {"commonsensical": [], "nonsensical": [], "anti_commonsensical": []}
 
-    cladder_results = _batch_generate(cladder_pending, max_new_tokens=TRAIN_MAX_TOKENS)
-    for k, (text, item) in enumerate(cladder_results):
+    cladder_results = _batch_generate(cladder_pending, max_new_tokens=1500)
+    cladder_results = cladder_results.detach().cpu() if isinstance(cladder_results, torch.Tensor) else cladder_results
+    for k, (text, item) in tqdm(enumerate(cladder_results), desc="Scoring CLaDDer"):
         if k == 0:
             print(f"\n[eval cladder sample]\n{text}\n")
         gt     = item["gt"]
@@ -788,8 +794,9 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
     causci_effect    = []
     causci_mres      = []
 
-    causci_results = _batch_generate(causci_pending, max_new_tokens=512)
-    for k, (text, item) in enumerate(causci_results):
+    causci_results = _batch_generate(causci_pending, max_new_tokens=1500)
+    causci_results = causci_results.detach().cpu() if isinstance(causci_results, torch.Tensor) else causci_results
+    for k, (text, item) in tqdm(enumerate(causci_results), desc="Scoring CauSciBench"):
         if k == 0:
             print(f"\n[eval causci sample]\n{text}\n")
         gt       = item["gt"]
@@ -863,6 +870,7 @@ def evaluate(ddp_model: torch.nn.Module, dataloader: DataLoader, device: str) ->
         print(f"  {k}: {v:.4f}")
 
     ddp_model.train()
+    print("Resuming training...\n")
     return metrics
 
 import traceback
@@ -917,7 +925,7 @@ def train(train_dataset, test_dataset):
             print(f"Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
 
         train_sampler    = DistributedSampler(train_dataset, shuffle=True)
-        train_dataloader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, sampler=train_sampler, collate_fn=collate_fn, pin_memory=False)
+        train_dataloader = DataLoader(train_dataset, batch_size=2, sampler=train_sampler, collate_fn=collate_fn, pin_memory=False)
         test_dataloader  = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, pin_memory=False)
 
         ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
@@ -1016,6 +1024,13 @@ def train(train_dataset, test_dataset):
                             tokenizer.save_pretrained(ckpt_path)
                             print(f"Checkpoint saved → {ckpt_path} | train_loss={train_loss_avg:.4f} cladder_train_acc={train_acc:.4f} causci_train_acc={causci_train_acc:.4f}")
 
+                            torch.cuda.empty_cache()  # free up GPU memory before evaluation
+                        
+                        dist.barrier()  # ensure checkpoint is saved before any rank tries to evaluate
+
+                    if global_step % EVAL_EVERY == 0:
+                        dist.barrier()  # hold all ranks while rank 0 evaluates
+                        if local_rank == 0:
                             step_metrics = evaluate(ddp_model, test_dataloader, device)
                             eval_steps.append(global_step)
                             for k, v in step_metrics.items():
