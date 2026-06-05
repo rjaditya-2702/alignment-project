@@ -10,3 +10,4 @@ output/
 old_code/
 output_RL/
 output_fine_tune_lora/
+lora_adapter/

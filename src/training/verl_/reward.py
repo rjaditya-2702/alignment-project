@@ -78,33 +78,75 @@ def batch_judge(prompts: list[str]) -> list[float]:
 # ---------------------------------------------------------------------------
 
 def _make_step1_prompt(parsed: dict, gt: dict) -> str:
-    return f"""
-You are a causal inference expert.
-Return 1 if correct, 0 if wrong. Nothing else. You have just 1 token to respond.
-Predicted causal graph: {parsed.get('step1', '')}
+    return f"""You are a causal inference expert evaluating graph extraction.
+
 Reference causal graph: {gt.get('step1', '')}
+Predicted causal graph: {parsed.get('step1', '')}
 
-Does the predicted graph correctly identify:
-1. The right variables
-2. All directed edges in the correct direction
-3. No spurious edges added
-"""
+Rules:
+- Ignore variable name formatting differences (e.g., X→Y same as X -> Y)
+- Edge direction must be correct
+- All reference edges must be present
+- Extra edges = wrong
+- Missing edges = wrong
 
+Reply with exactly one character: 1 (correct) or 0 (wrong)."""
 
 def _make_step3_prompt(parsed: dict, gt: dict) -> str:
-    return f"""
-You are a causal inference expert.
-Return 1 if equivalent, 0 if wrong. Nothing else. You have just 1 token to respond.
-Query type: {gt.get('step2', '')}
-Predicted estimand: {parsed.get('step3', '')}
-Reference estimand: {gt.get('step3', '')}
+    return f"""You are a causal inference expert evaluating estimand equivalence.
 
-Are these mathematically equivalent?
-"""
+Causal graph: {gt.get('step1', '')}
+Query type: {gt.get('step2', '')}
+
+Reference estimand: {gt.get('step3', '')}
+Predicted estimand: {parsed.get('step3', '')}
+
+Given the causal graph and query type above, are the two estimands mathematically equivalent?
+Equivalent means: same quantity being estimated, potentially expressed differently.
+Count as equivalent:
+- Backdoor adjustment expanded vs compact form
+- Algebraic rearrangements
+- Summation order differences
+- Using ATE/ATT notation vs explicit do-expression when unambiguous
+
+Count as NOT equivalent:
+- Missing do-operator when intervention is required
+- Wrong conditioning set (e.g., conditioning on a collider)
+- Wrong rung (e.g., associational expression for a counterfactual query)
+- Estimating a different variable than the reference
+
+Reply with exactly one character: 1 (equivalent) or 0 (not equivalent)."""
+
+# -------------------------- V1 ----------------------------------------
+
+# def _make_step1_prompt(parsed: dict, gt: dict) -> str:
+#     return f"""
+# You are a causal inference expert.
+# Return 1 if correct, 0 if wrong. Nothing else. You have just 1 token to respond.
+# Predicted causal graph: {parsed.get('step1', '')}
+# Reference causal graph: {gt.get('step1', '')}
+
+# Does the predicted graph correctly identify:
+# 1. The right variables
+# 2. All directed edges in the correct direction
+# 3. No spurious edges added
+# """
+
+
+# def _make_step3_prompt(parsed: dict, gt: dict) -> str:
+#     return f"""
+# You are a causal inference expert.
+# Return 1 if equivalent, 0 if wrong. Nothing else. You have just 1 token to respond.
+# Query type: {gt.get('step2', '')}
+# Predicted estimand: {parsed.get('step3', '')}
+# Reference estimand: {gt.get('step3', '')}
+
+# Are these mathematically equivalent?
+# """
 
 
 # ---------------------------------------------------------------------------
-# Scoring — unchanged from TRL
+# Scoring
 # ---------------------------------------------------------------------------
 
 def reward_cladder_precomputed(
@@ -113,25 +155,70 @@ def reward_cladder_precomputed(
     s1_score: int,
     s3_score: int | None,
 ) -> tuple[float, dict]:
-    
+
     scores = {}
-    
-    scores['step1'] = s1_score  # 0 or 1
-    scores['step2'] = 1 if prediction.get('step2','').strip().lower() == ground_truth.get('step2','').strip().lower() else 0
-    scores['step3'] = s3_score if s3_score is not None else 0
-    scores['step5'] = 1 if prediction.get('step5','').strip().lower() == ground_truth.get('step5','').strip().lower() else 0
-    
-    # weighted additive — always produces variance across rollouts
-    reward = (
-        0.15 * scores['step1'] +
-        0.25 * scores['step2'] +
-        0.10 * scores['step3'] +
-        0.50 * scores['step5']
-    )
-    # shift to [-1, +1]
-    reward = 2 * reward - 1
-    
+
+    scores['step1'] = s1_score  # graph extraction
+    scores['step2'] = 1 if prediction.get('step2', '').strip().lower() == \
+                           ground_truth.get('step2', '').strip().lower() else 0  # query type
+    scores['step3'] = s3_score if s3_score is not None else 0  # formalization
+    scores['step5'] = 1 if prediction.get('step5', '').strip().lower() == \
+                           ground_truth.get('step5', '').strip().lower() else 0  # final answer
+
+    reasoning_score = (
+        0.30 * scores['step1'] +
+        0.40 * scores['step2'] +
+        0.30 * scores['step3']
+    )  # in [0, 1]
+
+    final_correct = scores['step5']  # 0 or 1
+
+    # Require reasoning to be nonzero to get credit for correct final answer
+    # This kills the "guess and get rewarded" shortcut
+    if final_correct and reasoning_score == 0.0:
+        # lucky guess with no reasoning — penalize
+        reward = -0.5
+    elif final_correct and reasoning_score > 0.0:
+        # correct answer with some reasoning — scale by reasoning quality
+        reward = 0.5 + 0.5 * reasoning_score  # in [0.5, 1.0]
+    elif not final_correct and reasoning_score > 0.5:
+        # good reasoning but wrong answer — small positive (likely a hard question)
+        reward = 0.1 * reasoning_score
+    else:
+        # wrong answer, poor reasoning
+        reward = -1.0 + reasoning_score  # in [-1.0, -0.7] depending on partial credit
+
     return reward, scores
+
+# -------------------------------- V2 -------------------------------
+
+# def reward_cladder_precomputed(
+#     prediction: dict,
+#     ground_truth: dict,
+#     s1_score: int,
+#     s3_score: int | None,
+# ) -> tuple[float, dict]:
+    
+#     scores = {}
+    
+#     scores['step1'] = s1_score  # 0 or 1
+#     scores['step2'] = 1 if prediction.get('step2','').strip().lower() == ground_truth.get('step2','').strip().lower() else 0
+#     scores['step3'] = s3_score if s3_score is not None else 0
+#     scores['step5'] = 1 if prediction.get('step5','').strip().lower() == ground_truth.get('step5','').strip().lower() else 0
+    
+#     # weighted additive — always produces variance across rollouts
+#     reward = (
+#         0.15 * scores['step1'] +
+#         0.25 * scores['step2'] +
+#         0.10 * scores['step3'] +
+#         0.50 * scores['step5']
+#     )
+#     # shift to [-1, +1]
+#     reward = 2 * reward - 1
+    
+#     return reward, scores
+
+# ------------------------------- V1 --------------------------------
 
 # def reward_cladder_precomputed(
 #     prediction: dict,
@@ -231,13 +318,10 @@ def reward_causci(prediction, ground_truth, library_effect, library_success):
     
     return reward, scores
 
-# def reward_causci(
-#     prediction: dict,
-#     ground_truth: dict,
-#     library_effect: float,
-# ) -> tuple[float, dict]:
-#     scores = {}
+# ------------------------------- V1 --------------------------------
 
+# def reward_causci(prediction: dict, ground_truth: dict, library_effect: float, ) -> tuple[float, dict]:
+#     scores = {}
 #     pred_method = prediction.get('step2', '').strip().lower()
 #     ref_method  = ground_truth.get('step2', '')
 #     if ref_method is not None:
