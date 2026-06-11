@@ -22,6 +22,9 @@ Logging:
     veRL native console lines carry step, loss, KL — parsed separately.
 """
 
+import sys, os
+sys.path.insert(0, "/iopsstor/scratch/cscs/ajannali/project/causal_alignment")
+
 import re
 import json
 import atexit
@@ -39,8 +42,9 @@ _eval_pass    = [0]  # number of eval passes completed
 # ---------------------------------------------------------------------------
 # Judge client
 # ---------------------------------------------------------------------------
-
-_judge_client = OpenAI(base_url="http://localhost:8001/v1", api_key="token")
+import os
+_JUDGE_HOST = os.environ.get("JUDGE_HOST", "localhost")
+_judge_client = OpenAI(base_url=f"http://{_JUDGE_HOST}:8001/v1", api_key="token")
 JUDGE_MODEL   = "Qwen/Qwen3-8B"  # must match what the judge server is serving
 
 def _sanitize_col(name: str) -> str:

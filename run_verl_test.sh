@@ -211,10 +211,6 @@ python3 -m verl.trainer.main_ppo \
 
 TRAIN_EXIT=${PIPESTATUS[0]}
 
-# ── Parse logs → CSV (copy verl_metrics.csv to laptop for plotting) ─────────
-echo "Parsing training log..."
-python3 /iopsstor/scratch/cscs/ajannali/project/causal_alignment/src/training/verl_/parse_verl_logs.py verl_training_test.log verl_metrics_test.csv
-
 # ── Cleanup ─────────────────────────────────────────────────────────────────
 ray stop
 kill "$JUDGE_PID" 2>/dev/null

@@ -28,7 +28,11 @@ def _load(csv_path: str) -> pd.DataFrame:
 
 
 def _formula(outcome, treatment, controls):
-    rhs = [treatment] + (controls or [])
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+    ]
+    rhs = [treatment] + clean_controls
     return f"{outcome} ~ {' + '.join(rhs)}"
 
 
@@ -47,10 +51,17 @@ def _result(coef, se, alpha=0.05):
 # 1. diff_in_means
 # ------------------------------------------------------------------
 def run_diff_in_means(df, treatment, outcome, controls=None):
-    df = df.dropna(subset=[treatment, outcome] + (controls or []))
+
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
+    df = df.dropna(subset=[treatment, outcome] + clean_controls)
     if len(df) < 2:
         return _result(0.0, 0.0)
-    formula = _formula(outcome, treatment, controls)
+    formula = _formula(outcome, treatment, clean_controls)
     model = smf.ols(formula, data=df).fit(cov_type="HC3")
     if treatment not in model.params:
         return _result(0.0, 0.0)
@@ -63,10 +74,17 @@ def run_diff_in_means(df, treatment, outcome, controls=None):
 # 2. ols
 # ------------------------------------------------------------------
 def run_ols(df, treatment, outcome, controls=None):
-    df = df.dropna(subset=[treatment, outcome] + (controls or []))
+
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
+    df = df.dropna(subset=[treatment, outcome] + clean_controls)
     if len(df) < 2:
         return _result(0.0, 0.0)
-    formula = _formula(outcome, treatment, controls)
+    formula = _formula(outcome, treatment, clean_controls)
     model = smf.ols(formula, data=df).fit(cov_type="HC3")
     if treatment not in model.params:
         return _result(0.0, 0.0)
@@ -79,10 +97,17 @@ def run_ols(df, treatment, outcome, controls=None):
 # 3. ipw
 # ------------------------------------------------------------------
 def run_ipw(df, treatment, outcome, controls=None, estimand="ATE"):
-    df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
+
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
+    df = df.copy().dropna(subset=[treatment, outcome] + clean_controls)
     if len(df) < 2 or df[treatment].nunique() < 2:
         return _result(0.0, 0.0)
-    X = df[controls].values if controls else np.ones((len(df), 1))
+    X = df[clean_controls].values if clean_controls else np.ones((len(df), 1))
     T = df[treatment].values
     Y = df[outcome].values
 
@@ -143,10 +168,16 @@ def run_ipw(df, treatment, outcome, controls=None, estimand="ATE"):
 def run_matching(df, treatment, outcome, controls=None, estimand="ATT"):
     from sklearn.neighbors import NearestNeighbors
 
-    df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
+    df = df.copy().dropna(subset=[treatment, outcome] + clean_controls)
     if len(df) < 2 or df[treatment].nunique() < 2:
         return _result(0.0, 0.0)
-    X = df[controls].values if controls else np.ones((len(df), 1))
+    X = df[clean_controls].values if clean_controls else np.ones((len(df), 1))
     T = df[treatment].values
     Y = df[outcome].values
 
@@ -230,6 +261,13 @@ def run_matching(df, treatment, outcome, controls=None, estimand="ATT"):
 # 5. did
 # ------------------------------------------------------------------
 def run_did(df, treatment, outcome, time_variable, group_variable, controls=None):
+
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
     df = df.copy()
 
     # detect canonical vs TWFE
@@ -242,10 +280,10 @@ def run_did(df, treatment, outcome, time_variable, group_variable, controls=None
         interaction = f"{post}_x_{treat}"
         df[interaction] = df[post] * df[treat]
         # Explicit dropna so df[group_variable] stays in sync with smf's design matrix
-        df = df.dropna(subset=[outcome, post, treat, interaction] + (controls or []))
+        df = df.dropna(subset=[outcome, post, treat, interaction] + clean_controls)
         if len(df) < 2:
             return _result(0.0, 0.0)
-        rhs = [post, treat, interaction] + (controls or [])
+        rhs = [post, treat, interaction] + clean_controls
         formula = f"{outcome} ~ {' + '.join(rhs)}"
         model = smf.ols(formula, data=df).fit(
             cov_type="cluster", cov_kwds={"groups": df[group_variable]}
@@ -256,8 +294,8 @@ def run_did(df, treatment, outcome, time_variable, group_variable, controls=None
         se   = model.bse[interaction]
     else:
         # TWFE — staggered treatment
-        df = df.dropna(subset=[treatment, outcome, group_variable, time_variable] + (controls or []))
-        controls = [c for c in (controls or []) if c != treatment]
+        df = df.dropna(subset=[treatment, outcome, group_variable, time_variable] + clean_controls)
+        controls = [c for c in clean_controls if c != treatment]
         controls = list(dict.fromkeys(controls))  # dedupe, preserve order
         if len(df) < 2:
             return _result(0.0, 0.0)
@@ -293,7 +331,16 @@ def run_did(df, treatment, outcome, time_variable, group_variable, controls=None
 def run_rdd(df, treatment, outcome, running_variable, cutoff, controls=None):
     from rdd import rdd
 
-    df = df.copy().dropna(subset=[running_variable, outcome] + (controls or []))
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
+    df = df.copy().dropna(
+        subset=[running_variable, outcome] + clean_controls
+    )
+
     if len(df) < 2:
         return _result(0.0, 0.0)
     # rdd package expects the running variable centered at cutoff
@@ -304,7 +351,7 @@ def run_rdd(df, treatment, outcome, running_variable, cutoff, controls=None):
         xname="_running",
         yname=outcome,
         cut=0.0,
-        controls=controls or [],
+        controls=clean_controls,
         verbose=False,
     )
     result = model.fit()
@@ -319,7 +366,14 @@ def run_rdd(df, treatment, outcome, running_variable, cutoff, controls=None):
 # 7. iv (2SLS)
 # ------------------------------------------------------------------
 def run_iv(df, treatment, outcome, instrument, controls=None):
-    df = df.copy().dropna(subset=[treatment, outcome, instrument] + (controls or []))
+
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
+    df = df.copy().dropna(subset=[treatment, outcome, instrument] + clean_controls)
     if len(df) < 2:
         return _result(0.0, 0.0)
     if df[treatment].nunique() < 2 or df[instrument].nunique() < 2:
@@ -327,7 +381,7 @@ def run_iv(df, treatment, outcome, instrument, controls=None):
 
     df["const"] = 1.0
     # Drop zero-variance controls — IV2SLS does a strict full-rank check on [exog, endog]
-    valid_controls = [c for c in (controls or []) if df[c].nunique() > 1]
+    valid_controls = [c for c in clean_controls if df[c].nunique() > 1]
     exog_cols = ["const"] + valid_controls
 
     # Pre-check both rank conditions that IV2SLS._validate_inputs() enforces
@@ -366,22 +420,29 @@ def run_frontdoor(df, treatment, outcome, mediator, controls=None):
     Stage 2: Y ~ M + T (+ controls), using stage 1 predictions
     ATE = E[Y | do(T=1)] - E[Y | do(T=0)]
     """
+
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
     df = df.copy().dropna(
-        subset=[treatment, outcome, mediator] + (controls or [])
+        subset=[treatment, outcome, mediator] + clean_controls
     )
     if len(df) < 2:
         return _result(0.0, 0.0)
 
     def _frontdoor_ate(df):
         # stage 1: T -> M
-        f1 = _formula(mediator, treatment, controls)
+        f1 = _formula(mediator, treatment, clean_controls)
         m1 = smf.ols(f1, data=df).fit()
         df = df.copy()
         df["_m_hat_t1"] = m1.predict(df.assign(**{treatment: 1}))
         df["_m_hat_t0"] = m1.predict(df.assign(**{treatment: 0}))
 
         # stage 2: (M, T) -> Y
-        f2 = _formula(outcome, mediator, [treatment] + (controls or []))
+        f2 = _formula(outcome, mediator, [treatment] + clean_controls)
         m2 = smf.ols(f2, data=df).fit()
 
         # ATE via frontdoor formula
@@ -410,10 +471,17 @@ def run_frontdoor(df, treatment, outcome, mediator, controls=None):
 # ------------------------------------------------------------------
 
 def run_glm(df, treatment, outcome, controls=None):
-    df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
+
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
+    df = df.copy().dropna(subset=[treatment, outcome] + clean_controls)
     if len(df) < 2:
         return _result(0.0, 0.0)
-    formula = _formula(outcome, treatment, controls)
+    formula = _formula(outcome, treatment, clean_controls)
 
     # detect outcome type
     unique_vals = df[outcome].dropna().unique()
@@ -447,10 +515,6 @@ def run_glm(df, treatment, outcome, controls=None):
     return _result(coef, se)
 
 # ------------------------------------------------------------------
-# 10. backdoor
-# ------------------------------------------------------------------
-
-# ------------------------------------------------------------------
 # 10. backdoor (g-computation / standardization)
 # ------------------------------------------------------------------
 def run_backdoor(df, treatment, outcome, controls=None, estimand="ATE"):
@@ -468,7 +532,14 @@ def run_backdoor(df, treatment, outcome, controls=None, estimand="ATE"):
     Estimation uses a flexible outcome regression with T:Z interactions
     so the conditional outcome surface can vary across treatment arms.
     """
-    df = df.copy().dropna(subset=[treatment, outcome] + (controls or []))
+
+    clean_controls = [
+        c for c in (controls or [])
+        if c and isinstance(c, str) and c.strip()
+        and c.strip() in df.columns  # must actually exist in the dataframe
+    ]
+
+    df = df.copy().dropna(subset=[treatment, outcome] + clean_controls)
     if len(df) < 2 or df[treatment].nunique() < 2:
         return _result(0.0, 0.0)
 
@@ -477,9 +548,9 @@ def run_backdoor(df, treatment, outcome, controls=None, estimand="ATE"):
     is_binary_outcome = set(unique_vals).issubset({0, 1, 0.0, 1.0}) and len(unique_vals) >= 2
 
     # Build outcome model: Y ~ T + Z + T:Z   (interactions let CATE vary in Z)
-    if controls:
-        interaction_terms = " + ".join([f"{treatment}:{c}" for c in controls])
-        rhs = f"{treatment} + {' + '.join(controls)} + {interaction_terms}"
+    if clean_controls:
+        interaction_terms = " + ".join([f"{treatment}:{c}" for c in clean_controls])
+        rhs = f"{treatment} + {' + '.join(clean_controls)} + {interaction_terms}"
     else:
         rhs = treatment
     formula = f"{outcome} ~ {rhs}"
@@ -493,7 +564,7 @@ def run_backdoor(df, treatment, outcome, controls=None, estimand="ATE"):
                 model = smf.ols(formula, data=data).fit()
         except (np.linalg.LinAlgError, ValueError):
             # fall back to additive (no interactions) on rank failure
-            rhs_fallback = _formula(outcome, treatment, controls)
+            rhs_fallback = _formula(outcome, treatment, clean_controls)
             try:
                 if is_binary_outcome:
                     model = smf.logit(rhs_fallback, data=data).fit(disp=False)
