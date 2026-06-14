@@ -96,6 +96,10 @@ srun --overlap -N1 -n1 -w "$head_node" --environment="$EDF" bash -c '
     done
 
     unset CUDA_VISIBLE_DEVICES
+    unset ROCR_VISIBLE_DEVICES
+    unset HIP_VISIBLE_DEVICES
+
+
 
     ray start --head --node-ip-address='"$HEAD_IP"' --port=6379 --num-gpus=4 --num-cpus=48
     sleep 8
@@ -173,6 +177,11 @@ srun --overlap -N1 -n1 -w "$head_node" --environment="$EDF" bash -c '
 A_PID=$!
 
 srun --overlap -N1 -n1 -w "$worker_node" --environment="$EDF" bash -c "
+
+    unset CUDA_VISIBLE_DEVICES
+    unset ROCR_VISIBLE_DEVICES
+    unset HIP_VISIBLE_DEVICES
+    
     source $VENV/bin/activate; cd $PROJECT
     until ray start --address=$HEAD_IP:6379 --num-gpus=4 --num-cpus=48 --block; do
         echo 'head not ready, retrying in 5s'; sleep 5
