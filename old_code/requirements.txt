@@ -1,0 +1,46 @@
+# Core training
+torch
+transformers
+trl
+peft
+accelerate
+datasets
+
+# vLLM (rollout engine + judge server for TRL)
+vllm
+
+# sglang (judge server for veRL — vLLM and veRL conflict)
+sglang
+
+# veRL (FSDP-based GRPO trainer)
+verl
+
+# Ray (cluster backend for veRL)
+ray[default]
+
+# Judge / synthetic data client
+openai
+
+# Causal estimation library (tool_calling.py)
+numpy
+pandas
+statsmodels
+scikit-learn
+linearmodels
+scipy
+rdd
+
+# Efficient kernels (required by TRL GRPOConfig use_liger_kernel=True)
+liger-kernel
+
+# Plotting
+matplotlib
+
+# Efficient attention (Qwen3 flash_attention_2 / flash_attention_3)
+flash-attn
+
+# Progress bars
+tqdm
+
+# QLoRA quantization (SFT)
+bitsandbytes

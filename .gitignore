@@ -7,8 +7,13 @@ logs/
 scratch.md
 dataset/
 output/
-old_code/
 output_RL/
 output_fine_tune_lora/
 lora_adapter/
 data/
+dryrun.md
+footnotes.md
+training.md
+doverifier/
+original_data/
+*.jsonl
