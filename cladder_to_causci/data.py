@@ -32,6 +32,8 @@ import re
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from schema import (CLADDER_SYSTEM, CLADDER_USER, CAUSCI_SYSTEM, format_target, parse,
                     parse_mapping, verbalize_background)
@@ -229,6 +231,27 @@ def build_splits():
 
 # ── veRL parquet ─────────────────────────────────────────────────────────────
 
+# veRL concatenates ALL data.val_files into one Arrow table (pa.concat_tables, default promotion),
+# which fails if the `extra_info` struct has different nested fields across files. So every RL parquet
+# shares ONE pinned schema: extra_info always carries all 5 keys, and `columns` is typed list<string>
+# even when empty (an untyped [] infers list<null> and re-triggers the concat error).
+_VAL_SCHEMA = pa.schema([
+    ("prompt", pa.list_(pa.struct([("content", pa.string()), ("role", pa.string())]))),
+    ("data_source", pa.string()),
+    ("reward_model", pa.struct([("ground_truth", pa.string())])),
+    ("extra_info", pa.struct([("columns", pa.list_(pa.string())), ("csplit", pa.string()),
+                              ("csv_path", pa.string()), ("id", pa.string()), ("split", pa.string())])),
+])
+
+
+def _extra(id, split, csplit="", columns=None, csv_path=""):
+    return {"columns": columns or [], "csplit": csplit, "csv_path": csv_path, "id": id, "split": split}
+
+
+def _write_parquet(records, dst):
+    pq.write_table(pa.Table.from_pylist(records, schema=_VAL_SCHEMA), OUT / dst)
+
+
 def build_parquet():
     for src, dst, split in (("train_rl.jsonl", "train_rl.parquet", "train"),
                             ("test_rl.jsonl", "test.parquet", "test")):
@@ -238,9 +261,9 @@ def build_parquet():
                        {"role": "user", "content": r["prompt"]}],
             "data_source": r["source"],
             "reward_model": {"ground_truth": json.dumps(r["groundtruth"])},
-            "extra_info": {"split": split, "id": str(r["id"])},
+            "extra_info": _extra(id=str(r["id"]), split=split),
         } for r in rows]
-        pd.DataFrame(records).to_parquet(OUT / dst, index=False)
+        _write_parquet(records, dst)
         print(f"{len(records):>5} rows → {dst}")
 
 
@@ -256,11 +279,11 @@ def build_causci_val():
                        {"role": "user", "content": causci_user(r["description"], cols, r["query"])}],
             "data_source": "causci",
             "reward_model": {"ground_truth": json.dumps({"step1": r["step1"], "step2": r["method"]})},
-            "extra_info": {"split": "causci", "csplit": r["source"], "columns": cols,
-                           "csv_path": r["csv_path"], "id": str(r["id"])},
+            "extra_info": _extra(id=str(r["id"]), split="causci", csplit=r["source"],
+                                 columns=cols, csv_path=r["csv_path"]),
         })
     if records:
-        pd.DataFrame(records).to_parquet(OUT / "causci_val.parquet", index=False)
+        _write_parquet(records, "causci_val.parquet")
         cov = collections.Counter(r["extra_info"]["csplit"] for r in records)
         print(f"{len(records):>5} rows → causci_val.parquet  {dict(cov)}")
 

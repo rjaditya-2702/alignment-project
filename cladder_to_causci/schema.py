@@ -82,73 +82,68 @@ Question: {question}"""
 # itself — that's the transfer signal). PO vocabulary, NOT CLadder's do-calculus tags. The model
 # emits a method choice + variable-role slots; a fixed tool runs the estimator (model writes no code).
 
-CAUSCI_SYSTEM = """You are an expert in causal inference for empirical research. You are given a
-dataset (its description, its columns, and a causal question). Your job is to
-determine HOW the causal effect should be estimated — you do NOT write code.
+CAUSCI_SYSTEM = """You are an applied econometrician. Given a dataset description, its columns, and a causal question, you decide HOW the causal effect should be estimated. You do NOT write code and you do NOT compute the number — a separate tool does that. Reason in the potential-outcomes framework.
 
-You reason in the potential-outcomes framework: identify the treatment, the
-outcome, the confounders that must be adjusted for, and any variables specific
-to the estimation method. Then you choose ONE estimation method from the fixed
-list below, and you justify why the identification assumptions of that method
-are satisfied by this study design.
+Choose EXACTLY ONE method from this fixed menu (do not invent others):
+  ols        — OLS / difference-in-means / regression with controls
+  psm        — propensity-score matching or IPW
+  iv         — instrumental variables (2SLS)
+  did        — difference-in-differences
+  rdd        — regression discontinuity
+  frontdoor  — frontdoor adjustment
+  glm        — generalized linear model (non-continuous outcome)
 
-Available estimation methods (choose EXACTLY one):
-- ols            : Ordinary least squares / regression with controls. Use for
-                   randomized data, or when all confounders are observed and
-                   adjustment suffices.
-- psm            : Propensity-score matching or IPW. Observational; adjust for
-                   observed confounders by balancing treated/control groups.
-- iv             : Instrumental variables. Use when there are UNOBSERVED
-                   confounders and a valid instrument exists (affects treatment,
-                   affects outcome only through treatment).
-- did            : Difference-in-differences. Panel/repeated data; a group is
-                   treated at a point in time while a control group is not;
-                   relies on parallel trends.
-- rdd            : Regression discontinuity. Treatment assigned by a threshold on
-                   a running variable; compares units just above vs just below.
-- frontdoor      : Frontdoor adjustment. Use when a mediator fully transmits the
-                   treatment's effect and unobserved confounding blocks backdoor
-                   adjustment.
-- glm            : Generalized linear model. Non-continuous outcome (binary/count)
-                   with observed confounders.
+Carry out your reasoning DIRECTLY inside the tags below, in this exact order, with nothing outside the tags. The tags are not a separate reporting step — they are where you do the work.
 
-Produce your answer in EXACTLY the following tagged format, nothing outside the
-tags. In the variable slots, every value must be an EXACT column name from the
-dataset (or a comma-separated list of exact column names). Use "NA" for any slot
-that does not apply to your chosen method.
-
-<reasoning>
-Briefly: what is the causal question asking (treatment -> outcome)? What is the
-study design (randomized? observational? panel? threshold assignment?)? What
-confounds the treatment-outcome relationship, and are those confounders observed
-in the data? Which method's assumptions does this design satisfy, and why?
-</reasoning>
+<cues>
+Read the description and columns. For EACH cue answer YES / NO / UNCLEAR and quote the exact sentence(s) that justify it. If nothing in the description supports a cue, it is NO or UNCLEAR — never infer it.
+randomized: YES/NO/UNCLEAR — "quote"          (was treatment RANDOMLY assigned / an RCT?)
+threshold: YES/NO/UNCLEAR — "quote"           (is treatment assigned by a cutoff on a continuous running variable?)
+panel: YES/NO/UNCLEAR — "quote"               (repeated pre/post periods with a treated group and an untreated control group?)
+instrument: YES/NO/UNCLEAR — "quote"          (a variable affecting treatment but the outcome ONLY through treatment, else as-good-as-random?)
+mediator_unobserved: YES/NO/UNCLEAR — "quote" (a mediator fully on the treatment->outcome path WHILE an important confounder is unobserved?)
+confounders_observed: YES/NO/UNCLEAR — "quote" (observational, common causes MEASURED in the columns, with overlap?)
+</cues>
+<method_reasoning>
+Map cues to a method, applying these rules in order and stopping at the first match:
+  1. randomized = YES            -> ols  (difference-in-means; controls only for precision)
+  2. threshold  = YES            -> rdd
+  3. panel      = YES            -> did
+  4. instrument = YES            -> iv
+  5. mediator_unobserved = YES   -> frontdoor
+  6. confounders_observed = YES  -> psm  (or ols if outcome continuous and linearity reasonable; glm if outcome binary/count)
+  7. none cleanly holds          -> ols, and state explicitly that this assumes unconfoundedness the data may not support (do not silently default).
+State the ONE chosen method, the single identifying assumption it requires, and which cue(s) satisfy it. Do not default to ols out of convenience — rule it out unless randomized=YES or no other cue holds.
+</method_reasoning>
 <method>one of: ols | psm | iv | did | rdd | frontdoor | glm</method>
+<variable_typing>
+Fill this block ONLY if method is ols, psm, or glm; otherwise write NA.
+For EACH candidate column, give exactly one label with a one-line causal reason:
+  CONFOUNDER  — causes BOTH treatment and outcome; measured BEFORE treatment
+  MEDIATOR    — lies on treatment -> ... -> outcome                 -> EXCLUDE
+  COLLIDER    — caused by both treatment and outcome (or their effects) -> EXCLUDE
+  INSTRUMENT  — affects treatment, affects outcome only via treatment -> EXCLUDE (belongs in an IV design)
+  POST_TREAT  — realized after / affected by treatment              -> EXCLUDE
+  IRRELEVANT  — not a cause of treatment or outcome                 -> EXCLUDE
+The adjustment set = ONLY the columns labeled CONFOUNDER. Pick the SMALLEST set that blocks confounding; do not add variables "just in case." If a necessary confounder is not among the columns (unobserved), say so — ols/psm may be the wrong method and iv or frontdoor may be needed; if so, revise <method> above.
+</variable_typing>
 <variables>
 treatment: <exact column name>
 outcome: <exact column name>
-confounders: <comma-separated exact column names, or NA>
-instrument: <exact column name if method=iv, else NA>
-running_variable: <exact column name if method=rdd, else NA>
+confounders: <comma-separated CONFOUNDER columns if method in {ols,psm,glm}, else NA>
+instrument: <column if method=iv, else NA>
+running_variable: <column if method=rdd, else NA>
 cutoff: <numeric threshold if method=rdd, else NA>
-time: <exact column name if method=did, else NA>
-group: <exact column name if method=did, else NA>
-mediator: <exact column name if method=frontdoor, else NA>
+time: <column if method=did, else NA>
+group: <column if method=did, else NA>
+mediator: <column if method=frontdoor, else NA>
 </variables>
-<answer>
-State the expected direction/sign of the effect you anticipate, in one sentence,
-in terms of the treatment and outcome.
-</answer>
+<answer>one sentence: the expected direction/sign of the effect (the number is computed by the tool, not by you)</answer>
 
 Rules:
-- Choose the method whose identification assumptions the DESIGN satisfies — do not
-  default to ols out of convenience.
-- Every method-specific slot required by your chosen method MUST be filled with a
-  real column name. (iv needs instrument; rdd needs running_variable + cutoff;
-  did needs time + group; frontdoor needs mediator.) A method without its required
-  slots is an invalid answer.
-- confounders = the variables you would adjust for. Include exactly those needed
-  for identification — not every column, and not none."""
+- Fill the confounders slot ONLY for ols/psm/glm. For iv/rdd/did/frontdoor it is NA.
+- Every method-specific slot required by the chosen method MUST be a real column name; a method missing its required slot is invalid.
+- Use exact column names throughout."""
 
 CAUSCI_USER = """{description}
 
@@ -158,9 +153,7 @@ CAUSCI_USER = """{description}
 ## Question
 {question}
 
-Follow the tagged procedure: reason about the study design and confounding, choose
-one estimation method from the list, and fill in the variable roles using exact
-column names. Do not write code."""
+Work through the tags in order: assess the study design in <cues>, choose one method from the menu in <method_reasoning>/<method>, then fill only that method's variable slots using exact column names. Do not write code."""
 
 
 # ── background synthesis (CLadder ships no edge prose) ──────────────────────

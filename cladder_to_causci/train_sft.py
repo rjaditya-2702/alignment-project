@@ -31,10 +31,10 @@ from schema import parse
 from reward import compute_eval_metrics, grade   # GRADER only — SFT never touches the reward
 
 BASE_MODEL = os.environ.get("SFT_BASE", "Qwen/Qwen3-8B")
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = int(os.environ.get("SFT_MAX_SEQ_LEN", 2048))   # bump for reasoning-augmented runs
 EVAL_EVERY = int(os.environ.get("SFT_EVAL_EVERY", 100))   # eval frequency (steps)
 EVAL_N = int(os.environ.get("SFT_EVAL_N", 256))           # test rows per periodic eval (rank 0)
-GEN_MAX_NEW = 512
+GEN_MAX_NEW = int(os.environ.get("SFT_GEN_MAX_NEW", 512))   # bump for reasoning-augmented runs
 GRAPH_GATE = 0.95                 # SFT→RL handoff: held-out graph-extraction F1 must clear this (near-ceiling)
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "output"

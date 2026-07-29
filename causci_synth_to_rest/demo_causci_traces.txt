@@ -1,0 +1,209 @@
+==========================================================================================
+[1] diff_in_means_0  (gold method=diff_in_means)
+QUESTION: Does giving students access to after-school tutoring help them perform better on end-of-year tests?
+COLUMNS : student_absences, baseline_math_score, reading_fluency_level, has_special_education_plan, receives_free_or_reduced_lunch, first_generation_college_aspiration, after_school_tutoring, end_of_year_test_score
+
+GOLD ANSWER:
+<method>ols</method>
+<variables>
+treatment: after_school_tutoring
+outcome: end_of_year_test_score
+confounders: student_absences, baseline_math_score, reading_fluency_level, has_special_education_plan, receives_free_or_reduced_lunch, first_generation_college_aspiration
+instrument: NA
+running_variable: NA
+cutoff: NA
+time: NA
+group: NA
+mediator: NA
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The question asks about the causal effect of after-school tutoring on student test performance, making `after_school_tutoring` the natural treatment variable and `end_of_year_test_score` the outcome of interest. Although the dataset comes from a randomized study, the remaining columns — `student_absences`, `baseline_math_score`, `reading_fluency_level`, `has_special_education_plan`, `receives_free_or_reduced_lunch`, and `first_generation_college_aspiration` — capture pre-existing student background characteristics and prior academic indicators that could still be associated with both treatment assignment and outcomes, particularly if randomization was imperfect or if these covariates explain residual variance in test scores. Including them as confounders in an OLS regression improves precision and controls for any residual imbalance. OLS is appropriate here because the outcome (`end_of_year_test_score`) is a continuous measure, the treatment is binary, and the study's randomized design supports a straightforward linear regression framework for estimating the average treatment effect without requiring more complex causal identification strategies like instrumental variables or difference-in-differences.
+
+==========================================================================================
+[2] ols_0  (gold method=ols)
+QUESTION: Did students who took part in the school support program perform better on their end-of-term exams than similar students who did not?
+COLUMNS : student_age_years, prior_math_score, parent_education_years, school_attendance_days, free_lunch_eligible, after_school_job, participated_in_study_program, end_of_term_exam_score
+
+GOLD ANSWER:
+<method>ols</method>
+<variables>
+treatment: participated_in_study_program
+outcome: end_of_term_exam_score
+confounders: student_age_years, prior_math_score, parent_education_years, school_attendance_days, free_lunch_eligible, after_school_job
+instrument: NA
+running_variable: NA
+cutoff: NA
+time: NA
+group: NA
+mediator: NA
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The question asks whether participation in the academic support program caused better exam results, making `participated_in_study_program` the treatment and `end_of_term_exam_score` the outcome. Because this is an observational study — not a randomized experiment — students who chose or were selected into the program likely differ systematically from those who did not, so simply comparing raw exam scores would conflate program effects with pre-existing differences. The remaining columns (`student_age_years`, `prior_math_score`, `parent_education_years`, `school_attendance_days`, `free_lunch_eligible`, and `after_school_job`) all capture background characteristics, family resources, and prior academic behavior that the dataset description explicitly identifies as factors used to track comparable students; these are plausible determinants of both program participation and exam performance, making them confounders that must be controlled. OLS regression is appropriate here because the outcome (`end_of_term_exam_score`) is continuous, the treatment is binary, and including the confounders as covariates in a linear model adjusts for their influence, allowing the coefficient on `participated_in_study_program` to reflect the conditional association between program participation and exam scores after accounting for the observed differences between groups.
+
+==========================================================================================
+[3] ipw_0  (gold method=ipw)
+QUESTION: Does giving students access to an after-school academic program improve their end-of-year math scores?
+COLUMNS : prior_test_score, attendance_days, parent_education_years, received_tutoring, eligible_for_free_lunch, after_school_program, end_of_year_math_score
+
+GOLD ANSWER:
+<method>psm</method>
+<variables>
+treatment: after_school_program
+outcome: end_of_year_math_score
+confounders: prior_test_score, attendance_days, parent_education_years, received_tutoring, eligible_for_free_lunch
+instrument: NA
+running_variable: NA
+cutoff: NA
+time: NA
+group: NA
+mediator: NA
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The question asks about the causal effect of enrolling in an after-school academic program on end-of-year math scores, making `after_school_program` the treatment and `end_of_year_math_score` the outcome. Because this is an observational study — students self-selected or were selected into the program rather than being randomly assigned — direct comparison of participants and non-participants would be confounded by pre-existing differences between the groups. The remaining columns (`prior_test_score`, `attendance_days`, `parent_education_years`, `received_tutoring`, and `eligible_for_free_lunch`) all capture characteristics that plausibly influence both the likelihood of enrolling in the program and math performance: prior academic ability, school engagement, family socioeconomic background, additional academic support, and economic disadvantage. These variables must therefore be treated as confounders. Propensity Score Matching (PSM) is appropriate here because it addresses selection bias in an observational setting by matching treated and untreated students who have similar probabilities of program enrollment based on those confounders, creating a more balanced comparison group and enabling a cleaner estimate of the program's causal effect.
+
+==========================================================================================
+[4] matching_0  (gold method=matching)
+QUESTION: Did students who took part in the tutoring program end the year with stronger math performance than similar students who did not?
+COLUMNS : student_age, baseline_test_score, received_free_lunch, has_college_educated_parent, attends_after_school_program, participated_in_tutoring_program, end_of_year_math_score
+
+GOLD ANSWER:
+<method>psm</method>
+<variables>
+treatment: participated_in_tutoring_program
+outcome: end_of_year_math_score
+confounders: student_age, baseline_test_score, received_free_lunch, has_college_educated_parent, attends_after_school_program
+instrument: NA
+running_variable: NA
+cutoff: NA
+time: NA
+group: NA
+mediator: NA
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The question asks whether participation in the tutoring program causally improved math performance, making `participated_in_tutoring_program` the natural treatment variable and `end_of_year_math_score` the outcome. Because this is an observational study — students were not randomly assigned to tutoring but opted in — there is likely selection bias: students who chose tutoring may differ systematically from those who did not. The remaining columns (`student_age`, `baseline_test_score`, `received_free_lunch`, `has_college_educated_parent`, and `attends_after_school_program`) all capture pre-existing background characteristics or concurrent support factors that could independently influence both the likelihood of seeking tutoring and end-of-year math performance, making them confounders. For example, `baseline_test_score` reflects prior academic ability, which predicts both tutoring uptake and later achievement, while `has_college_educated_parent` and `received_free_lunch` capture socioeconomic factors that shape access to and motivation for academic support. Propensity score matching (PSM) is appropriate here because it addresses this selection bias by pairing tutored students with observationally similar non-tutored students across all these confounders, effectively creating a quasi-experimental comparison group and isolating the effect of the tutoring program itself on math outcomes.
+
+==========================================================================================
+[5] iv_0  (gold method=iv)
+QUESTION: Does participating in the after-school support program improve students' math test scores?
+COLUMNS : student_age, household_income, parent_education_years, school_distance_km, female_student, receives_free_lunch, first_generation_college_aspirant, attends_tutoring, program_eligibility_score, after_school_program_participation, math_test_score
+
+GOLD ANSWER:
+<method>iv</method>
+<variables>
+treatment: after_school_program_participation
+outcome: math_test_score
+confounders: student_age, household_income, parent_education_years, school_distance_km, female_student, receives_free_lunch, first_generation_college_aspirant, attends_tutoring
+instrument: program_eligibility_score
+running_variable: NA
+cutoff: NA
+time: NA
+group: NA
+mediator: NA
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The question asks about the causal effect of `after_school_program_participation` on `math_test_score`, making these the natural treatment and outcome variables. However, participation in the program is almost certainly not randomly assigned — students who choose or are able to attend likely differ systematically from those who do not. Columns like `household_income`, `parent_education_years`, `receives_free_lunch`, and `first_generation_college_aspirant` all capture socioeconomic and family background factors that simultaneously influence both the likelihood of program participation and math performance, making them confounders. Similarly, `student_age`, `school_distance_km`, `female_student`, and `attends_tutoring` reflect individual and logistical characteristics that could affect both participation and test outcomes and must be controlled for.
+
+The key feature of this dataset is `program_eligibility_score`, described as a school-assigned score that determines access to the program. This score acts as an instrument: it influences whether a student participates in the after-school program (relevance condition), but its effect on math test scores should operate only through that participation rather than through any direct academic pathway of its own — it is an administrative eligibility cutoff, not a measure of student ability or motivation. Because eligibility is school-assigned based on this score rather than chosen by students or families, it is plausibly independent of the unobserved confounders that would otherwise bias a simple comparison. This setup — an eligibility score driving program access in an observational study — is a classic context for instrumental variable estimation, which can recover a consistent causal estimate of the program's effect on math scores despite the endogeneity of participation.
+
+==========================================================================================
+[6] did_0  (gold method=did)
+QUESTION: Did the academic support program improve students’ math performance after it was introduced, compared with similar students who did not receive it?
+COLUMNS : unit_id, post, program_exposure, math_assessment_score, prior_test_score, attendance_rate, household_income_index, ell_status, free_lunch_eligible, special_education_status
+
+GOLD ANSWER:
+<method>did</method>
+<variables>
+treatment: program_exposure
+outcome: math_assessment_score
+confounders: prior_test_score, attendance_rate, household_income_index, ell_status, free_lunch_eligible, special_education_status
+instrument: NA
+running_variable: NA
+cutoff: NA
+time: post
+group: program_exposure
+mediator: NA
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The question asks whether the program improved math performance after its introduction, comparing students who received it against similar students who did not — a classic before-and-after, treated-versus-untreated structure. The `post` column captures the temporal divide (before and after the program began), and `program_exposure` identifies which students received the intervention, making these the natural time and group variables for a difference-in-differences (DiD) design. DiD is appropriate here because the district introduced the program at a specific point in time, and the dataset contains repeated observations indexed by `post`, allowing estimation of the treatment effect by comparing the change in outcomes across time between exposed and unexposed students. The outcome of interest is `math_assessment_score`, as the question explicitly asks about math performance. The remaining columns — `prior_test_score`, `attendance_rate`, `household_income_index`, `ell_status`, `free_lunch_eligible`, and `special_education_status` — represent pre-existing student characteristics that could confound the relationship between program exposure and math outcomes (e.g., students with higher prior scores or better attendance may be more likely to be selected into the program and also perform better regardless), so they must be controlled for to isolate the program's causal effect.
+
+==========================================================================================
+[7] rdd_0  (gold method=rdd)
+QUESTION: Did being offered the tutoring program improve students’ end-of-year math performance?
+COLUMNS : prior_test_score, attendance_rate, english_learner, free_lunch_eligible, special_education, eligibility_score, received_tutoring, end_of_year_math_score
+
+GOLD ANSWER:
+<method>rdd</method>
+<variables>
+treatment: received_tutoring
+outcome: end_of_year_math_score
+confounders: prior_test_score, attendance_rate, english_learner, free_lunch_eligible, special_education
+instrument: NA
+running_variable: eligibility_score
+cutoff: NA
+time: NA
+group: NA
+mediator: NA
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The dataset describes a school district that assigned students to a tutoring program based on whether their `eligibility_score` exceeded a set cutoff, making `eligibility_score` a natural running variable for a regression discontinuity design. Because assignment to the program is determined by crossing this threshold, students just below and just above the cutoff are comparable in all other respects, allowing a clean causal comparison — this is precisely the logic of RDD. The question asks about the effect on `end_of_year_math_score`, which is the only outcome measure in the dataset and therefore the outcome variable. The actual receipt of tutoring is captured in `received_tutoring`, which serves as the treatment, since the question concerns whether the program itself (not merely eligibility) improved performance. The remaining columns — `prior_test_score`, `attendance_rate`, `english_learner`, `free_lunch_eligible`, and `special_education` — are background characteristics that describe students' academic and socioeconomic profiles before the intervention; including them as confounders improves precision and accounts for any residual variation near the cutoff, even though the RDD design already handles most confounding through the discontinuity logic.
+
+==========================================================================================
+[8] frontdoor_0  (gold method=frontdoor)
+QUESTION: Did the tutoring program help students do better on their end-of-year exams?
+COLUMNS : student_age, household_income, eligible_for_free_lunch, first_generation_college_aspirant, received_tutoring_program, intermediate_test_score, end_of_year_exam_score
+
+GOLD ANSWER:
+<method>frontdoor</method>
+<variables>
+treatment: received_tutoring_program
+outcome: end_of_year_exam_score
+confounders: student_age, household_income, eligible_for_free_lunch, first_generation_college_aspirant
+instrument: NA
+running_variable: NA
+cutoff: NA
+time: NA
+group: NA
+mediator: intermediate_test_score
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The question asks whether receiving the tutoring program causally improved end-of-year exam scores, making `received_tutoring_program` the treatment and `end_of_year_exam_score` the outcome. The baseline characteristics recorded before the program began — `student_age`, `household_income`, `eligible_for_free_lunch`, and `first_generation_college_aspirant` — are pre-treatment variables that describe students' socioeconomic and demographic background, meaning they could influence both who was selected into the tutoring program and how students ultimately performed on exams, making them confounders. Critically, the dataset description notes that `intermediate_test_score` is an early test score used to track academic progress *after the program began*, placing it temporally between the treatment and the final outcome. This means the tutoring program likely improves end-of-year performance by first improving intermediate academic progress, which in turn boosts final exam scores — a classic mediating pathway. Because the confounders affect both treatment selection and outcome, direct adjustment is complicated, but the front-door criterion applies here: the effect of the tutoring program on the outcome can be identified by estimating how the treatment affects the mediator and then how the mediator affects the outcome, bypassing the unblocked backdoor paths through the confounders.
+
+==========================================================================================
+[9] glm_0  (gold method=glm)
+QUESTION: Did joining the school mentoring program help students become more likely to pass the end-of-year exam?
+COLUMNS : student_age, days_absent, baseline_test_score, free_lunch_eligible, first_generation_college_aspirant, english_learner, special_education_services, mentoring_program_participation, passed_end_of_year_exam
+
+GOLD ANSWER:
+<method>glm</method>
+<variables>
+treatment: mentoring_program_participation
+outcome: passed_end_of_year_exam
+confounders: student_age, days_absent, baseline_test_score, free_lunch_eligible, first_generation_college_aspirant, english_learner, special_education_services
+instrument: NA
+running_variable: NA
+cutoff: NA
+time: NA
+group: NA
+mediator: NA
+</variables>
+<answer>positive</answer>
+
+TEACHER REASONING:
+The question asks whether joining the mentoring program causally increases the likelihood of passing the end-of-year exam, making `mentoring_program_participation` the treatment and `passed_end_of_year_exam` the binary outcome. Because the program is voluntary and targeted at struggling or disadvantaged students, participation is not randomly assigned — students who join likely differ systematically from those who do not. The remaining columns (`student_age`, `days_absent`, `baseline_test_score`, `free_lunch_eligible`, `first_generation_college_aspirant`, `english_learner`, `special_education_services`) all capture pre-existing student characteristics that could influence both the decision to join the program and the probability of passing the exam, making them confounders that must be controlled for to isolate the program's effect. Since the outcome is binary (passed or not), a generalized linear model (GLM) with a logistic link is the appropriate regression framework, as it models the probability of a binary event while allowing all confounders to be included as covariates to adjust for selection bias introduced by the voluntary, need-based enrollment process.
+

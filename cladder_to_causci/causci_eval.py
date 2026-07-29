@@ -142,17 +142,25 @@ def score_causci(rollout, columns, gt, split=None):
 
     gold_c = {_sanit(c) for c in _controls_list(g1.get("controls"))}
     pred_c = {_sanit(c) for c in (_match_col(x, cmap) for x in p["confounders"]) if c}
+    tp = len(pred_c & gold_c)
+    ctrl_acc = float(pred_c == gold_c)                              # exact-set match (predicted the gold set exactly)
+    ctrl_recall = tp / len(gold_c) if gold_c else 1.0              # |correct| / |gold| (empty gold → satisfied)
+    ctrl_prec = tp / len(pred_c) if pred_c else (1.0 if not gold_c else 0.0)  # |correct| / |predicted|
     if not gold_c and not pred_c:
         conf = 1.0
     elif not gold_c or not pred_c:
         conf = 0.0
     else:
-        tp = len(pred_c & gold_c)
         conf = 2 * tp / (len(pred_c) + len(gold_c)) if tp else 0.0   # set-F1 (= 2·overlap/(|p|+|g|))
 
     comp = {"method": method, "treatment": t_ok, "outcome": o_ok, "confounder_f1": conf,
+            "control_recall": ctrl_recall, "control_precision": ctrl_prec, "control_acc": ctrl_acc,
             "gold_method": gm or "none", "pred_method": pm or "none", "valid": float(valid),
-            "split": split or "?"}
+            "split": split or "?",
+            # raw role picks (for truncation-free treatment/outcome role-confusion matrices)
+            "pred_treatment": treat or "", "gold_treatment": g1.get("treatment") or "",
+            "pred_outcome": out or "", "gold_outcome": g1.get("outcome") or "",
+            "gold_controls": list(_controls_list(g1.get("controls")))}
     return (method + t_ok + o_ok + conf) / 4.0, comp
 
 
@@ -164,6 +172,9 @@ def compute_causci_metrics(items):
          "treatment_acc": sum(c["treatment"] for c in comps) / n,
          "outcome_acc": sum(c["outcome"] for c in comps) / n,
          "confounder_f1": sum(c["confounder_f1"] for c in comps) / n,
+         "control_recall": sum(c.get("control_recall", 0.0) for c in comps) / n,
+         "control_precision": sum(c.get("control_precision", 0.0) for c in comps) / n,
+         "control_acc": sum(c.get("control_acc", 0.0) for c in comps) / n,
          "valid_rate": sum(c["valid"] for c in comps) / n, "n": len(items)}
     # method macro-F1 over gold buckets present
     tp = collections.Counter(); fp = collections.Counter(); fn = collections.Counter()
@@ -187,8 +198,14 @@ def compute_causci_metrics(items):
     for c in comps:
         by_split[c.get("split") or "?"].append(c)
     for sp, cs in by_split.items():
-        m[f"{sp}/method"] = sum(c["method"] for c in cs) / len(cs)
-        m[f"{sp}/conf_f1"] = sum(c["confounder_f1"] for c in cs) / len(cs)
+        ns = len(cs)
+        m[f"{sp}/method"] = sum(c["method"] for c in cs) / ns
+        m[f"{sp}/treatment"] = sum(c["treatment"] for c in cs) / ns
+        m[f"{sp}/outcome"] = sum(c["outcome"] for c in cs) / ns
+        m[f"{sp}/conf_f1"] = sum(c["confounder_f1"] for c in cs) / ns
+        m[f"{sp}/control_recall"] = sum(c.get("control_recall", 0.0) for c in cs) / ns
+        m[f"{sp}/control_precision"] = sum(c.get("control_precision", 0.0) for c in cs) / ns
+        m[f"{sp}/control_acc"] = sum(c.get("control_acc", 0.0) for c in cs) / ns
     return m
 
 

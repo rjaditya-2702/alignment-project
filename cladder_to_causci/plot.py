@@ -208,8 +208,9 @@ def plot_sft_phases():
     w = 0.8 / len(phases)
     for ax, (title, metrics) in zip(axes, panels):
         for i, p in enumerate(phases):
-            ax.bar([x + i * w for x in range(len(metrics))], [recs[p].get(k, 0.0) for k in metrics],
-                   w, label=lbl[p])
+            b = ax.bar([x + i * w for x in range(len(metrics))], [recs[p].get(k, 0.0) for k in metrics],
+                       w, label=lbl[p])
+            ax.bar_label(b, fmt="%.2f", fontsize=6)   # explicit values incl. genuine 0.00
         ax.set_xticks([x + w * (len(phases) - 1) / 2 for x in range(len(metrics))])
         ax.set_xticklabels([k.replace("causci_", "") for k in metrics], rotation=15, fontsize=9)
         ax.set_ylim(0, 1); ax.grid(True, axis="y", alpha=0.3); ax.legend()
@@ -222,17 +223,48 @@ def plot_sft_phases():
     print(f"Saved → {PLOTS / 'sft_phases.png'}")
 
 
-def plot_causci_thinking():
-    """Thinking OFF vs ON bars per checkpoint, from output/sft/causci_thinking.jsonl."""
-    f = SFT_DIR / "causci_thinking.jsonl"
+def plot_rungs():
+    """CLadder performance ACROSS RUNGS (1/2/3), base vs after-SFT, from phase_metrics.jsonl."""
+    f = SFT_DIR / "phase_metrics.jsonl"
     if not f.exists():
-        print("no output/sft/causci_thinking.jsonl — skip CauSci thinking plot")
+        print("no output/sft/phase_metrics.jsonl — skip rung plot")
         return
-    rows = [json.loads(l) for l in open(f)]
+    snap = {json.loads(l)["phase"]: json.loads(l) for l in open(f)}
+    phases = [p for p in ("base", "A", "B") if p in snap]
+    lbl = {"base": "base", "A": "after Phase A", "B": "after Phase B"}
+    metrics = [("answer_acc", "answer"), ("graph_f1", "graph F1"),
+               ("estimand_acc", "estimand"), ("full", "full-chain")]
+    rungs = [1, 2, 3]
+    fig, axes = plt.subplots(1, len(metrics), figsize=(4.5 * len(metrics), 4.5))
+    w = 0.8 / len(phases)
+    for ax, (key, title) in zip(axes, metrics):
+        for j, p in enumerate(phases):
+            xs = [r + (j - (len(phases) - 1) / 2) * w for r in range(len(rungs))]
+            b = ax.bar(xs, [snap[p].get(f"r{r}/{key}", 0.0) for r in rungs], w, label=lbl[p])
+            ax.bar_label(b, fmt="%.2f", fontsize=6)   # show 0.00 so genuine-zero bars are visible
+        ax.set_xticks(range(len(rungs))); ax.set_xticklabels([f"rung {r}" for r in rungs])
+        ax.set_ylim(0, 1); ax.set_title(title); ax.grid(True, axis="y", alpha=0.3); ax.legend(fontsize=8)
+    fig.suptitle("CLadder — performance across rungs (reasoning-augmented SFT)", fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    PLOTS.mkdir(parents=True, exist_ok=True)
+    fig.savefig(PLOTS / "cladder_rungs.png", dpi=140, bbox_inches="tight")
+    print(f"Saved → {PLOTS / 'cladder_rungs.png'}")
+
+
+def plot_causci_thinking():
+    """Thinking OFF vs ON bars per checkpoint. Combines the SFT eval (causci_thinking.jsonl:
+    base/A/B) and the RL curve (causci_thinking_rl.jsonl: rl_<step>) on one axis, SFT first
+    then RL steps in ascending order."""
+    sft_f, rl_f = SFT_DIR / "causci_thinking.jsonl", SFT_DIR / "causci_thinking_rl.jsonl"
+    rows = [json.loads(l) for l in open(sft_f)] if sft_f.exists() else []
+    rl_rows = [json.loads(l) for l in open(rl_f)] if rl_f.exists() else []
+    rl_rows.sort(key=lambda r: r.get("step", 0))                    # rl_50, rl_100, ... in order
+    rows += rl_rows
     if not rows:
+        print("no causci_thinking*.jsonl — skip CauSci thinking plot")
         return
     metrics = ["method_correctness", "treatment_acc", "outcome_acc", "confounder_f1"]
-    labels = list(dict.fromkeys(r["label"] for r in rows))          # preserve file order
+    labels = list(dict.fromkeys(r["label"] for r in rows))          # SFT (file order) then RL (by step)
     data = {(r["label"], r["think"]): r for r in rows}
     fig, axes = plt.subplots(1, len(metrics), figsize=(6 * len(metrics), 5))
     x = range(len(labels)); w = 0.38

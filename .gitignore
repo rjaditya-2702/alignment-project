@@ -17,3 +17,4 @@ training.md
 doverifier/
 original_data/
 *.jsonl
+output*/
